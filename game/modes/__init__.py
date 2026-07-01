@@ -1,0 +1,63 @@
+# -*- coding: utf-8 -*-
+"""رجیستری مودها (Mode System).
+هر مود یک ماژول مستقل است؛ افزودن مود جدید = ساخت کلاس + یک خط در REGISTRY.
+"""
+"""رجیستری مودها (Mode System)."""
+from .classic import ClassicRandomMode, ClassicChoiceMode
+from .blank import BlankMode
+from .variable import VariableMode
+from .namefamily import NameFamilyMode
+from .clue import ClueMode
+
+# ترتیب نمایش در پنل انتخاب مود
+MODE_ORDER = ["classic_random", "classic_choice", "blank", "namefamily", "variable", "clue"]
+
+REGISTRY = {
+    ClassicRandomMode.id: ClassicRandomMode,
+    BlankMode.id: BlankMode,
+    ClassicChoiceMode.id: ClassicChoiceMode,
+    VariableMode.id: VariableMode,
+    NameFamilyMode.id: NameFamilyMode,
+    ClueMode.id: ClueMode,
+}
+
+_META = {
+    "classic_random": {
+        "name": "کلاسیک رندوم",
+        "emoji": "🎯",
+        "desc": "دسته به‌صورت تصادفی انتخاب می‌شود."
+    },
+    "classic_choice": {
+        "name": "کلاسیک انتخابی",
+        "emoji": "📂",
+        "desc": "سازنده دسته را انتخاب می‌کند."
+    },
+    "blank": {
+        "name": "جای خالی",
+        "emoji": "🧩",
+        "desc": "کلمه‌ی ناقص را کامل کن."
+    },
+    "namefamily": {
+        "name": "اسم‌وفامیل",
+        "emoji": "✍️",
+        "desc": "با یک حرف، دسته‌هارو پر کن."
+    },
+    "variable": {
+        "name": "قوانین متغیر",
+        "emoji": "🎲",
+        "desc": "هر دور قوانین عوض می‌شود."
+    },
+    "clue": {
+        "name": "سرنخ",
+        "emoji": "🕵️",
+        "desc": "از روی سرنخ، جواب را حدس بزن."
+    },
+}
+
+def mode_meta(mode_id):
+    m = _META.get(mode_id, _META["classic_random"])
+    return {"id": mode_id, **m}
+
+
+def get_mode_class(mode_id):
+    return REGISTRY.get(mode_id, ClassicRandomMode)
