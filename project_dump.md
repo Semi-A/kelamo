@@ -22,9 +22,11 @@ FILE: config.py
 import os
 from dotenv import load_dotenv
 # توکن ربات (از @BotFather) — حتماً به‌صورت متغیر محیطی ست شود.
+
+
 load_dotenv()
 BOT_TOKEN = os.getenv("KALEMO_BOT_TOKEN")
-
+DATABASE_URL = os.getenv("DATABASE_URL")
 # یوزرنیم ربات (بدون @) — برای لینک افزودن به گروه
 BOT_USERNAME = os.getenv("KALEMO_BOT_USERNAME")
 
@@ -72,7 +74,9 @@ FILE: core\db.py
 """
 
 import re
-import sqlite3
+import psycopg
+import os
+import config
 import time
 from contextlib import contextmanager
 from core.garden_db import init_garden
@@ -699,7 +703,32 @@ def add_suggestion(user_id, user_name, word, category, description="", source="m
     if not word or not category:
         return False
 
+    if word_exists(category, word):
+        return False
+
     with conn() as c:
+        cat = get_category(category)
+        cat_id = cat["id"] if cat else None
+
+        if cat_id:
+            dup = c.execute(
+                "SELECT 1 FROM words WHERE category_id=? AND normalized_word=? LIMIT 1",
+                (cat_id, normalize_word(word))
+            ).fetchone()
+
+            if dup:
+                return False
+
+        pending = c.execute(
+            """SELECT 1 FROM word_suggestions
+               WHERE category=? AND normalized_word=? 
+               AND status='pending' LIMIT 1""",
+            (category, normalize_word(word))
+        ).fetchone()
+
+        if pending:
+            return False
+
         c.execute("""
             INSERT INTO word_suggestions(
                 user_id, user_name, word, normalized_word,
@@ -1285,16 +1314,14 @@ _AR_FA = str.maketrans({
 })
 # اعراب و علائم کوچک عربی
 _DIACRITICS = re.compile(r"[\u064B-\u0652\u0670\u0640]")
-_SPACES = re.compile(r"\s+")
+_SEPARATORS = re.compile(r"[\s\u200c\u200d\-ـ_]+")
 
 
 def normalize_word(text):
-    s = (text or "").strip()
-    s = s.translate(_AR_FA)
-    s = _DIACRITICS.sub("", s)      # حذف اعراب و کشیده (ـ)
-    s = s.replace("\u200c", "")     # نیم‌فاصله
-    s = s.replace("-", "")
-    s = _SPACES.sub("", s)          # حذف تمام فاصله‌ها
+    """برای مقایسه دقیق واژه‌ها: فاصله، نیم‌فاصله، خط فاصله و کشیده نادیده گرفته می‌شوند."""
+    s = (text or "").strip().translate(_AR_FA)
+    s = _DIACRITICS.sub("", s)
+    s = _SEPARATORS.sub("", s)
     return s.lower()
 ```
 
@@ -1681,7 +1708,10 @@ def profile_view(uid, name):
                 xp_needed=pr.xp_needed(p["level"]), coins=p["coins"],
                 streak=p["streak"], wins=p["wins"], games=p["games"],
                 best=p["best_score"])
-    return cards.profile_card(data)
+    card = cards.profile_card(data)
+    st = db.suggestion_stats_for_user(uid)
+    card += f"\n\n💡 کلمات تاییدشده: <b>{st['approved']}</b>"
+    return card
 
 
 def mission_view(uid):
@@ -1818,44 +1848,65 @@ FILE: game\modes\__init__.py
 """رجیستری مودها (Mode System).
 هر مود یک ماژول مستقل است؛ افزودن مود جدید = ساخت کلاس + یک خط در REGISTRY.
 """
-from .classic import ClassicMode
+"""رجیستری مودها (Mode System)."""
+from .classic import ClassicRandomMode, ClassicChoiceMode
 from .blank import BlankMode
 from .variable import VariableMode
 from .namefamily import NameFamilyMode
 from .clue import ClueMode
 
 # ترتیب نمایش در پنل انتخاب مود
-MODE_ORDER = ["classic", "blank", "namefamily", "variable", "clue"]
+MODE_ORDER = ["classic_random", "classic_choice", "blank", "namefamily", "variable", "clue"]
 
 REGISTRY = {
-    ClassicMode.id: ClassicMode,
+    ClassicRandomMode.id: ClassicRandomMode,
     BlankMode.id: BlankMode,
+    ClassicChoiceMode.id: ClassicChoiceMode,
     VariableMode.id: VariableMode,
     NameFamilyMode.id: NameFamilyMode,
     ClueMode.id: ClueMode,
 }
 
 _META = {
-    "classic":    {"name": "کلاسیک",        "emoji": "🎯",
-                   "desc": "دسته می‌دم، کلمه‌ی مرتبط بگو."},
-    "blank":      {"name": "جای خالی",      "emoji": "🧩",
-                   "desc": "کلمه‌ی ناقص رو کامل کن."},
-    "namefamily": {"name": "اسم‌وفامیل",    "emoji": "✍️",
-                   "desc": "با یک حرف، همه‌ی دسته‌ها رو پر کن."},
-    "variable":   {"name": "قوانین متغیر",  "emoji": "🎲",
-                   "desc": "هر دور قوانین عوض می‌شه."},
-    "clue":       {"name": "سرنخ",          "emoji": "🕵️",
-                   "desc": "از روی سرنخ، جواب رو حدس بزن."},
+    "classic_random": {
+        "name": "کلاسیک رندوم",
+        "emoji": "🎯",
+        "desc": "دسته به‌صورت تصادفی انتخاب می‌شود."
+    },
+    "classic_choice": {
+        "name": "کلاسیک انتخابی",
+        "emoji": "📂",
+        "desc": "سازنده دسته را انتخاب می‌کند."
+    },
+    "blank": {
+        "name": "جای خالی",
+        "emoji": "🧩",
+        "desc": "کلمه‌ی ناقص را کامل کن."
+    },
+    "namefamily": {
+        "name": "اسم‌وفامیل",
+        "emoji": "✍️",
+        "desc": "با یک حرف، دسته‌هارو پر کن."
+    },
+    "variable": {
+        "name": "قوانین متغیر",
+        "emoji": "🎲",
+        "desc": "هر دور قوانین عوض می‌شود."
+    },
+    "clue": {
+        "name": "سرنخ",
+        "emoji": "🕵️",
+        "desc": "از روی سرنخ، جواب را حدس بزن."
+    },
 }
 
-
 def mode_meta(mode_id):
-    m = _META.get(mode_id, _META["classic"])
+    m = _META.get(mode_id, _META["classic_random"])
     return {"id": mode_id, **m}
 
 
 def get_mode_class(mode_id):
-    return REGISTRY.get(mode_id, ClassicMode)
+    return REGISTRY.get(mode_id, ClassicRandomMode)
 
 ```
 
@@ -1997,29 +2048,49 @@ FILE: game\modes\classic.py
 
 ```py
 # -*- coding: utf-8 -*-
-"""مود کلاسیک: یک دسته نمایش داده می‌شود، کاربر کلمه‌ی مرتبط می‌گوید."""
+"""مودهای کلاسیک: رندوم و انتخابی. هر دو فقط با دیتابیس معتبر کار می‌کنند."""
 from .base import BaseMode
 
-class ClassicMode(BaseMode):
-    id = "classic"; name = "کلاسیک"; emoji = "🎯"
+
+class ClassicRandomMode(BaseMode):
+    id = "classic_random"
+    name = "کلاسیک رندوم"
+    emoji = "🎯"
 
     def __init__(self, words, category="", ruleset=None):
         super().__init__(words, ruleset)
         self.category = category
 
     def tutorial(self):
-        return ("🎯 مود کلاسیک\n"
-                "یه دسته بهتون می‌دم؛ کلمه‌ی مرتبط و درست بفرستید.\n"
-                f"📂 دسته: {self.category}\nآماده باشید...")
+        return (
+            f"🎯 <b>کلاسیک رندوم</b>\n"
+            f"دسته: <b>{self.category}</b>\n"
+            "کلمه‌ی مرتبط بفرست."
+        )
 
     def new_question(self):
-        return {"prompt": f"📂 دسته: <b>{self.category}</b>\nیه کلمه‌ی مرتبط بگو!",
-                "answers": {self.norm(w) for w in self.words}}
+        return {
+            "prompt": f"📂 دسته: <b>{self.category}</b>\nکلمه‌ی مرتبط بگو.",
+            "answers": {self.norm(w) for w in self.words},
+        }
 
     def check_answer(self, question, text):
-        if self.norm(text) not in question["answers"]:
-            return False, "نامرتبط"
+        if self.norm(text) not in question.get("answers", set()):
+            return False, "نامعتبر"
         return True, None
+
+
+class ClassicChoiceMode(ClassicRandomMode):
+    id = "classic_choice"
+    name = "کلاسیک انتخابی"
+    emoji = "📂"
+
+    def tutorial(self):
+        return (
+            f"📂 <b>کلاسیک انتخابی</b>\n"
+            f"دسته: <b>{self.category}</b>\n"
+            "کلمه‌ی مرتبط بفرست."
+        )
 ```
 
 
@@ -2118,20 +2189,15 @@ PT_INVALID = 0
 PT_EMPTY = 0
 
 
-NAMEFAMILY_CATEGORIES = ["غذا", "رنگ", "میوه", "حیوان", "اشیا", "عضو بدن", "شهر", "کشور", "شغل"]
 
 
 def load_db_categories(limit=None):
-    """اسم‌وفامیل فقط همین ۹ دسته ثابت را نشان می‌دهد."""
+    """تمام دسته‌بندی‌های دارای کلمه در دیتابیس، بدون نیاز به تغییر کد."""
     from core import db
 
-    if hasattr(db, "seed_namefamily_words"):
-        db.seed_namefamily_words(clean_extra_categories=True)
+    cats = [cat for cat, cnt in db.list_categories() if int(cnt or 0) > 0]
 
-    available = dict(db.list_categories())
-    cats = [cat for cat in NAMEFAMILY_CATEGORIES if int(available.get(cat, 0) or 0) > 0]
-    return cats
-
+    return cats[:limit] if limit else cats
 
 class NameFamilyMode:
     id = "namefamily"
@@ -2575,6 +2641,7 @@ FILE: game\session.py
 import time
 from game.rules import RuleSet
 from game.modes import get_mode_class, mode_meta
+from core.normalize import normalize_word
 
 # گزینه‌های زمان مسابقه (ثانیه) — 0 یعنی نامحدود
 TIME_OPTIONS = [
@@ -2632,7 +2699,18 @@ class Session:
         self.timer_task = None
         # ---- شناسه پیام زنده‌ی بازی ----
         self.live_msg_id = None
+        self.correct_total = 0
+        self.wrong_total = 0
+        self.correct_by_user = {}
+        self.wrong_by_user = {}
+        self.warns = {}
+        self.warns = {}   # uid -> تعداد اخطار در همین بازی
 
+    def add_warn(self, uid):
+        """یک اخطار اضافه می‌کند و تعداد کل اخطارهای کاربر را برمی‌گرداند."""
+        self.warns[uid] = self.warns.get(uid, 0) + 1
+        return self.warns[uid]
+    
     # ---- Join System ----
     def join(self, uid, name):
         if self.state != "lobby":
@@ -2676,7 +2754,7 @@ class Session:
     def build_mode(self):
         cls = get_mode_class(self.mode_id)
         kwargs = {"ruleset": self.ruleset}
-        if self.mode_id == "classic":
+        if self.mode_id in ("classic_random", "classic_choice"):
             kwargs["category"] = self.category
         if self.mode_id == "blank":
             kwargs["difficulty"] = self.difficulty
@@ -2697,16 +2775,48 @@ class Session:
         if uid not in self.players:
             self.players[uid] = {"name": name, "score": 0}
         if nw in self.used:
+            self.wrong_total += 1
+            self.wrong_by_user[uid] = self.wrong_by_user.get(uid, 0) + 1
             return {"ok": False, "reason": "تکراری"}
         ok, reason = self.mode.check_answer(self.question, w)
         if not ok:
+            self.wrong_total += 1
+            self.wrong_by_user[uid] = self.wrong_by_user.get(uid, 0) + 1
             return {"ok": False, "reason": reason}
         self.used.add(nw)
+        self.correct_total += 1
+        self.correct_by_user[uid] = self.correct_by_user.get(uid, 0) + 1
         pts = 10
         if self.ruleset.is_active("bonus"):
             pts += 5
         self.players[uid]["score"] += pts
-        return {"ok": True, "points": pts, "score": self.players[uid]["score"]}
+        return {
+            "ok": True,
+            "points": pts,
+            "score": self.players[uid]["score"],
+            "found": len(self.used),
+            "total": len({normalize_word(w) for w in self.words})
+        }
+    
+    def progress(self):
+        total = len({
+            normalize_word(w)
+            for w in self.words
+            if (w or "").strip()
+        })
+        found = len(self.used)
+        return found, total
+
+
+    def is_completed(self):
+        found, total = self.progress()
+        return total > 0 and found >= total
+
+
+    def add_warn(self, uid):
+        self.warns[uid] = self.warns.get(uid, 0) + 1
+        return self.warns[uid]
+
 
     # ---- زمان ----
     def start_timer(self):
@@ -2747,10 +2857,10 @@ def get(chat_id):
 def exists(chat_id):
     return chat_id in _sessions
 
-def create(chat_id, host_id, host_name, mode_id="classic"):
+def create(chat_id, host_id, host_name, mode_id="classic_random"):
     from game.modes import REGISTRY
     if mode_id not in REGISTRY:
-        mode_id = "classic"
+        mode_id = "classic_random"
     s = Session(chat_id, host_id, host_name)
     s.mode_id = mode_id
     _sessions[chat_id] = s
@@ -2799,7 +2909,7 @@ import asyncio
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
-
+from telegram.error import BadRequest
 import config
 from core import db
 from features import admin_service as adm, player_service as svc
@@ -2881,6 +2991,90 @@ async def on_admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await q.message.edit_text(
             "🗂 <b>دسته‌ها</b>\n━━━━━━━━━━━━━━\n" + body,
             parse_mode=HTML, reply_markup=kb.admin_words_menu())
+
+    if action == "suggests":
+        rows = db.pending_suggestions(1)
+
+        if not rows:
+            return await q.message.edit_text(
+                "💡 پیشنهادی در صف بررسی نیست.",
+                reply_markup=kb.admin_back()
+            )
+
+        sug = rows[0]
+
+        text = (
+            "💡 <b>پیشنهاد کلمه</b>\n"
+            "━━━━━━━━━━━━━━\n"
+            f"کلمه: <b>{sug['word']}</b>\n"
+            f"دسته: <b>{sug['category']}</b>\n"
+            f"توضیح: {sug.get('description') or '—'}"
+        )
+
+        return await q.message.edit_text(
+            text,
+            parse_mode=HTML,
+            reply_markup=kb.admin_suggestion_kb(sug["id"])
+        )
+
+    if action == "sapp":
+        sid = int(parts[2])
+        ok, msg = db.approve_suggestion(sid, uid)
+
+        rows = db.pending_suggestions(1)
+
+        if rows:
+            sug = rows[0]
+            text = (
+                "💡 <b>پیشنهاد کلمه</b>\n"
+                "━━━━━━━━━━━━━━\n"
+                f"کلمه: <b>{sug['word']}</b>\n"
+                f"دسته: <b>{sug['category']}</b>\n"
+                f"توضیح: {sug.get('description') or '—'}"
+            )
+
+            return await q.message.edit_text(
+                "✅ " + msg + "\n\n" + text,
+                parse_mode=HTML,
+                reply_markup=kb.admin_suggestion_kb(sug["id"])
+            )
+
+        return await q.message.edit_text(
+            "✅ " + msg + "\n\nدیگه پیشنهادی باقی نمونده.",
+            parse_mode=HTML,
+            reply_markup=kb.admin_back()
+        )
+
+
+    if action == "srej":
+        sid = int(parts[2])
+
+        db.reject_suggestion(sid, uid)
+
+        rows = db.pending_suggestions(1)
+
+        if rows:
+            sug = rows[0]
+            text = (
+                "💡 <b>پیشنهاد کلمه</b>\n"
+                "━━━━━━━━━━━━━━\n"
+                f"کلمه: <b>{sug['word']}</b>\n"
+                f"دسته: <b>{sug['category']}</b>\n"
+                f"توضیح: {sug.get('description') or '—'}"
+            )
+
+            return await q.message.edit_text(
+                "❌ پیشنهاد رد شد.\n\n" + text,
+                parse_mode=HTML,
+                reply_markup=kb.admin_suggestion_kb(sug["id"])
+            )
+
+        return await q.message.edit_text(
+            "❌ پیشنهاد رد شد.\n\nدیگه پیشنهادی باقی نمونده.",
+            parse_mode=HTML,
+            reply_markup=kb.admin_back()
+        )
+
 
     if action == "admins":
         if not adm.is_owner(uid):
@@ -3038,30 +3232,90 @@ DIV = "━━━━━━━━━━━━━━━━"
 def _e(text):
     return html.escape(str(text or ""))
 
+_ART_SEED = r"""
+        .
+       / \
+      /___\
+   ___\___/___
+  /___________\
+"""
+
+_ART_SPROUT = r"""
+        |
+       \|/
+        |
+   _____|_____
+  /___________\
+"""
+
+_ART_SAPLING = r"""
+      \  |  /
+       \ | /
+        \|/
+         |
+         |
+   ______|______
+  /_____________\
+"""
+
+_ART_SMALL = r"""
+       .----.
+    .-'      '-.
+   /    ||      \
+   \    ||      /
+    '-. ||  .-'
+        ||
+        ||
+   _____||_____
+  /____________\
+"""
+
+_ART_TREE = r"""
+       .--------.
+    .-'          '-.
+   /   .------.     \
+  |   /        \     |
+  |   \        /     |
+   \   '------'     /
+    '-.          .-'
+        ||||||
+        ||||||
+   _____||||||_____
+  /________________\
+"""
+
+_ART_FRUIT = r"""
+       .--------.
+    .-'  o  o    '-.
+   /  o  .----.  o  \
+  |     /  oo  \     |
+  |  o  \      /  o  |
+   \  o  '----'  o  /
+    '-.   o  o   .-'
+        ||||||
+        ||||||
+   _____||||||_____
+  /________________\
+"""
 
 def _tree_art(tree):
     if not tree:
-        return "      🌰\n   ───────\n  هنوز بذری کاشته نشده"
+        return _ART_SEED
 
     growth = int(tree.get("growth") or 0)
-    rarity = tree.get("rarity") or "normal"
 
-    if rarity == "golden" and growth >= 80:
-        return "      🌳✨\n    ✨🍃🍃✨\n  🍃🌟🍃🌟🍃\n    ✨│││✨\n      │││"
-    if rarity == "rare" and growth >= 70:
-        return "      🌳💎\n    🍃💠🍃🍃\n  🍃🍃💠🍃🍃\n    🌸🍃🌸\n      │││"
-    if rarity == "blossom" and growth >= 65:
-        return "      🌳🌸\n    🌸🍃🍃🌸\n  🍃🌸🍃🌸🍃\n    🌸│││🌸\n      │││"
-    if growth < 20:
-        return "      🌱\n     ╱ ╲\n    خاک نرم"
-    if growth < 45:
-        return "      🌿\n    🌿🌿\n      │"
-    if growth < 70:
-        return "      🌳\n    🍃🍃🍃\n  🍃🍃🍃🍃\n      ││"
-    if growth < 100:
-        return "      🌳🍃\n    🍃🍃🍃🍃\n  🍃🍃🍃🍃🍃\n    🍃││🍃\n      │││"
-    return "      🌳✨\n    🍃🍃🍃🍃\n  🍃🍃🍃🍃🍃\n    🌸🍃🌸\n      │││"
 
+    if growth >= 100:
+        return _ART_FRUIT
+    if growth >= 80:
+        return _ART_TREE
+    if growth >= 60:
+        return _ART_SMALL
+    if growth >= 40:
+        return _ART_SAPLING
+    if growth >= 20:
+        return _ART_SPROUT
+    return _ART_SEED
 
 def _rarity_label(rarity):
     return {
@@ -3126,11 +3380,21 @@ def garden_card(uid, viewer_uid=None):
 
 def home_kb(uid):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌱 کاشت بذر", callback_data="g:plant"), InlineKeyboardButton("🎁 برداشت", callback_data="g:harvest")],
-        [InlineKeyboardButton("🎒 موجودی بذرها", callback_data="g:inv"), InlineKeyboardButton("👥 باغ دوستان", callback_data="g:friends")],
-        [InlineKeyboardButton("🔄 تازه‌سازی", callback_data="g:home")],
+        [
+            InlineKeyboardButton("🌱 کاشت بذر", callback_data="g:plant"),
+            InlineKeyboardButton("🎁 برداشت", callback_data="g:harvest")
+        ],
+        [
+            InlineKeyboardButton("🎒 موجودی بذرها", callback_data="g:inv"),
+            InlineKeyboardButton("👥 باغ دوستان", callback_data="g:friends")
+        ],
+        [
+            InlineKeyboardButton("📖 راهنمای باغچه", callback_data="g:help")
+        ],
+        [
+            InlineKeyboardButton("🔄 تازه‌سازی", callback_data="g:home")
+        ],
     ])
-
 
 def plant_kb(uid):
     seeds = db.garden_seed_inventory(uid)
@@ -3196,6 +3460,20 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         garden_service.on_daily_garden_visit(user.id)
         await q.answer()
         return await q.message.edit_text(garden_card(user.id, viewer_uid=user.id), parse_mode=HTML, reply_markup=home_kb(user.id))
+
+    if action == "help":
+        await q.answer()
+        text = ("📖 <b>راهنمای باغچه</b>\n" + DIV + "\n"
+                "• با بازی، پاسخ درست و ورود روزانه رشد می‌گیرد.\n"
+                "• هر روز می‌توانی باغ خودت و دوستانت را آبیاری کنی.\n"
+                "• وقتی رشد به ۱۰۰٪ برسد، برداشت فعال می‌شود.\n"
+                "• برداشت می‌تواند Coin، XP، Lucky Box یا بذر بدهد.\n"
+                "• بذرهای بهتر، پاداش جذاب‌تری دارند.")
+        return await q.message.edit_text(
+            text,
+            parse_mode=HTML,
+            reply_markup=home_kb(user.id)
+        )
 
     if action == "plant":
         if len(parts) >= 3:
@@ -3287,8 +3565,19 @@ from core import db
 from features import player_service as svc
 from game import session as sess
 from ui import panels, persona
+import html
+import time
 
 HTML = ParseMode.HTML
+
+import time
+from datetime import timedelta
+from telegram import ChatPermissions
+
+MAX_WARNS = 3                 # سقف اخطار قبل از سکوت
+MUTE_SECONDS = 5 * 60         # مدت سکوت: ۵ دقیقه
+FOCUS_WORD_LIMIT = 3          # بیش از این تعداد کلمه = پیام جمله‌ای
+
 def _arg(parts, i):
     try:
         return parts[i]
@@ -3336,6 +3625,17 @@ async def open_lobby(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_newgame(update, ctx):
+    chat = update.effective_chat
+    u = update.effective_user
+    # اگر بازی فعالی هست: پیام را پاک کن، اخطار بده (مگر معاف)
+    if chat.type in ("group", "supergroup") and sess.exists(chat.id):
+        s = sess.get(chat.id)
+        if await _is_privileged(ctx, s, chat.id, u.id):
+            return await update.message.reply_text(
+                "⚠️ یه مسابقه فعاله! اول «🏁 پایان» یا /endgame.")
+        await _safe_delete(update.message)
+        return await _warn_and_maybe_mute(
+            ctx, s, chat.id, u, "وقتی بازی فعاله نمی‌تونی بازی جدید بزنی")
     return await open_lobby(update, ctx)
 
 
@@ -3343,8 +3643,12 @@ async def cmd_endgame(update, ctx):
     chat = update.effective_chat
     if not sess.exists(chat.id):
         return await update.message.reply_text("الان مسابقه‌ای در جریان نیست.")
+    s = sess.get(chat.id)
+    u = update.effective_user
+    if not await _is_privileged(ctx, s, chat.id, u.id):
+        return await update.message.reply_text(
+            "⛔️ فقط سازنده‌ی بازی یا ادمین‌های گروه می‌تونن بازی رو تموم کنن.")
     await _finish(ctx, chat.id)
-
 
 async def cmd_settings(update, ctx):
     chat = update.effective_chat
@@ -3358,15 +3662,79 @@ async def cmd_settings(update, ctx):
                                     reply_markup=panels.settings_kb(s))
 
 
+# ---------- بررسی ادمین بودن در گروه تلگرام ----------
+async def _is_group_admin(ctx, chat_id, uid):
+    try:
+        m = await ctx.bot.get_chat_member(chat_id, uid)
+        return m.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+async def _is_privileged(ctx, s, chat_id, uid):
+    """سازنده‌ی بازی یا ادمین گروه؟ (این‌ها از همه‌ی قوانین معاف‌اند)"""
+    if s and uid == s.host_id:
+        return True
+    return await _is_group_admin(ctx, chat_id, uid)
+
+
+async def _safe_delete(msg):
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+async def _warn_and_maybe_mute(ctx, s, chat_id, u, reason_text):
+    """
+    یک اخطار ثبت می‌کند؛ در اخطار سوم کاربر را ۵ دقیقه سکوت می‌کند.
+    یک پیام کوتاه (خوداتخریب) در گروه می‌فرستد.
+    """
+    n = s.add_warn(u.id)
+    name = u.first_name or "کاربر"
+
+    if n >= MAX_WARNS:
+        muted = False
+        try:
+            await ctx.bot.restrict_chat_member(
+                chat_id, u.id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=int(time.time()) + MUTE_SECONDS,
+            )
+            muted = True
+        except Exception:
+            muted = False
+        # اخطارها را برای شروع دوباره صفر کن تا بعد از سکوت از نو شمرده شود
+        s.warns[u.id] = 0
+        if muted:
+            txt = (f"🔇 <a href=\"tg://user?id={u.id}\">{name}</a> "
+                   f"به‌خاطر تکرار تخلف ۵ دقیقه سکوت شد.")
+        else:
+            txt = (f"⚠️ <a href=\"tg://user?id={u.id}\">{name}</a> به سقف اخطار رسید، "
+                   f"ولی ربات دسترسی «محدودکردن اعضا» ندارد.")
+    else:
+        left = MAX_WARNS - n
+        txt = (f"⚠️ <a href=\"tg://user?id={u.id}\">{name}</a> {reason_text} "
+               f"(اخطار {n}/{MAX_WARNS} — {left} اخطار تا سکوت)")
+
+    try:
+        note = await ctx.bot.send_message(chat_id, txt, parse_mode=HTML)
+        # پیام هشدار را بعد از ۵ ثانیه پاک کن تا گروه شلوغ نشود
+        ctx.job_queue.run_once(
+            lambda c: c.bot.delete_message(chat_id, note.message_id),
+            5, name=f"delwarn:{chat_id}:{note.message_id}")
+    except Exception:
+        pass
+
 # ---------- بررسی دسترسی سازنده ----------
 def _host_only(s, uid):
     return uid == s.host_id
 
 
+
 HOST_ACTIONS = {"mode", "setmode", "rules", "toggle", "time", "settime",
-                "diff", "setdiff", "start", "cancel", "focus", "end"}
-
-
+                "diff", "setdiff", "cat", "catpage", "setcat",
+                "start", "cancel", "focus", "end"}
 # ---------- callbackها ----------
 async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -3408,6 +3776,38 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not s.set_mode(mid):
             return await q.answer("مود نامعتبر است.", show_alert=True)
         await q.answer(f"مود شد: {s.mode_name()}")
+        return await _refresh_lobby(q, s)
+    
+    if action == "cat":
+        cats = db.list_categories()
+        await q.answer()
+        return await q.message.edit_text(
+            panels.category_text(),
+            parse_mode=HTML,
+            reply_markup=panels.category_kb(cats, s.category),
+        )
+
+    if action == "catpage":
+        page = int(_arg(parts, 2) or 0)
+        cats = db.list_categories()
+        await q.answer()
+        return await q.message.edit_text(
+            panels.category_text(),
+            parse_mode=HTML,
+            reply_markup=panels.category_kb(cats, s.category, page=page),
+        )    
+
+    if action == "setcat":
+        page = int(_arg(parts, 2) or 0)
+        cat = ":".join(parts[3:]).strip()
+
+        if not cat or not db.get_category(cat):
+            return await q.answer("دسته نامعتبر است.", show_alert=True)
+
+        s.category = cat
+        s.words = db.list_words(cat) or []
+
+        await q.answer("دسته انتخاب شد.")
         return await _refresh_lobby(q, s)
 
     if action == "time":
@@ -3470,14 +3870,20 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if action == "start":
         if s.count() < 2:
             return await q.answer("حداقل دو بازیکن برای شروع لازم است.", show_alert=True)
+        if not _load_category_for_session(s):
+            return await q.answer(
+                "برای این مود دسته/کلمه کافی نیست.",
+                show_alert=True,
+            )
         await q.answer()
         return await _start_countdown(q, ctx, s)
 
     if action == "end":
+        if not await _is_privileged(ctx, s, chat_id, u.id):
+            return await q.answer(
+                "فقط سازنده یا ادمین گروه می‌تونه پایان بده.", show_alert=True)
         await q.answer()
         return await _finish(ctx, chat_id)
-    await q.answer("دستور ناشناخته", show_alert=True)
-    return
 
 async def _refresh_lobby(q, s):
     try:
@@ -3491,6 +3897,17 @@ async def _refresh_lobby(q, s):
 async def _start_countdown(q, ctx, s):
     s.state = "countdown"
     msg = q.message
+    mentions = _player_mentions(s)
+
+    if mentions:
+        try:
+            await ctx.bot.send_message(
+                s.chat_id,
+                "شروع مسابقه:\n" + mentions,
+                parse_mode=HTML,
+            )
+        except Exception:
+            pass
     s.live_msg_id = msg.message_id
     for n in (3, 2, 1):
         try:
@@ -3655,24 +4072,10 @@ async def _finish(ctx, chat_id, reason=None):
                 f"🎁 <b>{info['name']}</b> یک Lucky Box گرفت: {lucky_box.item_text(item)}"
             )
 
-    body = "\n".join(lines) if lines else "کسی امتیازی نگرفت 😅"
-    head = "⏰ <b>وقت تموم شد!</b>\n\n" if reason == "time" else ""
-    text = (f"{head}{persona.say('game_end')}\n\n"
-            f"🏁 <b>نتایج — {s.mode_name()}</b>\n"
-            f"{panels.DIV}\n{body}")
-
+    text = panels.finish_text(s, reason=reason) 
     if box_lines:
         text += "\n\n🎁 <b>Lucky Box</b>\n" + "\n".join(box_lines)
 
-    # پیام زنده را به کارت نتایج تبدیل کن
-    if s.live_msg_id:
-        try:
-            await ctx.bot.edit_message_text(
-                chat_id=chat_id, message_id=s.live_msg_id, text=text,
-                parse_mode=HTML)
-            return
-        except Exception:
-            pass
     await ctx.bot.send_message(chat_id, text, parse_mode=HTML)
 
 
@@ -3694,28 +4097,116 @@ async def on_group_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if s.is_round_based():
         return False
 
+    if _suggestion_hint(text):
+        return await _handle_group_suggestion(update, ctx, s, text)
+
     # --- مودهای سوال‌محور ---
     res = s.submit(u.id, nm, text)
     if res and res["ok"]:
-        await msg.reply_text(persona.say("good_answer", pts=res["points"])
-                             + f"  (مجموع: {res['score']})")
+        found, total = s.progress()
+
+        await msg.reply_text(
+            panels.answer_ok_text(
+                res["score"],
+                found,
+                total,
+            )
+        )
+
+        if s.is_completed():
+            await _finish(ctx, chat.id, reason="completed")
+            return True
+
         s.next_question()
         await _update_live(ctx, s)
+
+
         return True
-    return await _maybe_focus(s, msg, text, is_answer=res is not None)
+    return await _maybe_focus(ctx, s, msg, text, u, is_answer=res is not None)
+
+async def _maybe_focus(ctx, s, msg, text, u, is_answer):
+    if not s.focus_mode:
+        return False
+    too_long = len(text.split()) > FOCUS_WORD_LIMIT
+    if is_answer or not too_long:
+        return False
+    # سازنده و ادمین‌های گروه معاف‌اند
+    if await _is_privileged(ctx, s, s.chat_id, u.id):
+        return False
+    await _safe_delete(msg)
+    await _warn_and_maybe_mute(
+        ctx, s, s.chat_id, u, "حین بازی فقط جواب بده، نه جمله")
+    return True
 
 
-async def _maybe_focus(s, msg, text, is_answer):
-    if s.focus_mode:
-        too_long = len(text.split()) > 3
-        if (not is_answer) and too_long:
-            try:
-                await msg.delete()
-            except Exception:
-                pass
-            return True
-    return False
+async def handle_start_during_game(update, ctx):
+    chat = update.effective_chat
+    u = update.effective_user
+    s = sess.get(chat.id)
+    if not s:
+        return await open_lobby(update, ctx)
+    if await _is_privileged(ctx, s, chat.id, u.id):
+        return await update.message.reply_text(
+            "⚠️ یه مسابقه فعاله! اول «🏁 پایان» یا /endgame.")
+    await _safe_delete(update.message)
+    return await _warn_and_maybe_mute(
+        ctx, s, chat.id, u, "وقتی بازی فعاله نمی‌تونی بازی جدید شروع کنی")
 
+def _load_category_for_session(s):
+    if s.mode_id == "classic_choice" and not s.category:
+        return False
+    if not s.category:
+        cat = db.random_category()
+        if not cat:
+            return False
+        s.category = cat
+    s.words = db.list_words(s.category) or []
+    return bool(s.words) or s.is_round_based()
+
+def _player_mentions(s):
+    return " ".join(
+        f'<a href="tg://user?id={uid}">{html.escape(info.get("name") or "بازیکن")}</a>'
+        for uid, info in s.players.items()
+    )
+
+def _suggestion_hint(text):
+    t = (text or "").strip()
+    return (
+        t.startswith("+کلمه")
+        or t.startswith("پیشنهاد کلمه")
+        or t.startswith("/suggest")
+    )
+
+async def _handle_group_suggestion(update, ctx, s, text):
+    from features import suggestion_service as ss
+
+    raw = text.strip()
+
+    for prefix in ("+کلمه", "پیشنهاد کلمه", "/suggest"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):].strip()
+            break
+
+    parts = [p.strip() for p in raw.split("|")]
+
+    if len(parts) < 2:
+        return await update.message.reply_text(
+            "فرمت: +کلمه کلمه | دسته | توضیح اختیاری"
+        )
+
+    u = update.effective_user
+
+    ok, msg = ss.create(
+        u.id,
+        u.first_name,
+        parts[0],
+        parts[1],
+        parts[2] if len(parts) > 2 else "",
+        source="game",
+    )
+
+    await update.message.reply_text(("✅ " if ok else "⚠️ ") + msg)
+    return True
 ```
 
 
@@ -3867,6 +4358,18 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                "🎯 هر روز یه مأموریت تازه و جایزه‌ی ورود.\n"
                "🔥 هر روز سر بزن تا استریکت نپره!")
         return await q.message.edit_text(txt, parse_mode=HTML, reply_markup=kb.play_in_group())
+
+    if action == "garden":
+        from handlers import garden as garden_handlers
+        return await garden_handlers.open_garden(update, ctx)
+
+    if action == "suggest":
+        from handlers import suggestions
+        return await suggestions.start_suggest(update, ctx)
+
+    if action == "garden":
+        from handlers import garden as garden_handlers
+        return await garden_handlers.open_garden(update, ctx)
 
     if action == "play":
         return await q.message.edit_text(
@@ -4112,7 +4615,7 @@ FILE: handlers\router.py
 from telegram import Update
 from telegram.ext import ContextTypes
 from handlers import admin, lobby, menu, suggestions, namefamily_private
-
+from game import session as sess
 
 async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     chat = update.effective_chat
@@ -4136,10 +4639,15 @@ async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return
 
     # گروه: «شروع کلمو» / «شروع بازی» → باز کردن لابی
+        # گروه
     if lobby.is_start_text(text):
+        if sess.exists(chat.id):
+            # بازی فعاله → مثل /newgame تکراری رفتار کن (حذف + اخطار)
+            return await lobby.handle_start_during_game(update, ctx)
         return await lobby.open_lobby(update, ctx)
-    # در غیر این صورت، پیام بازی/حالت تمرکز
     await lobby.on_group_text(update, ctx)
+
+
 
 ```
 
@@ -4160,12 +4668,28 @@ HTML = ParseMode.HTML
 
 async def start_suggest(update, ctx):
     if update.effective_chat.type != "private":
-        return await update.message.reply_text("پیشنهاد کلمه را در چت خصوصی ربات ثبت کن.")
-
+        msg = update.message
+        if msg:
+            return await msg.reply_text(
+                "پیشنهاد کلمه را در چت خصوصی ربات ثبت کن."
+            )
+        return
     ctx.user_data["suggest_step"] = "word"
     ctx.user_data["suggest_data"] = {}
 
-    await update.message.reply_text(
+    target = (
+        update.callback_query.message
+        if update.callback_query
+        else update.message
+    )
+
+    send = (
+        target.edit_text
+        if update.callback_query
+        else target.reply_text
+    )
+
+    await send(
         "💡 <b>پیشنهاد کلمه جدید</b>\n"
         "━━━━━━━━━━━━━━\n"
         "اول خود کلمه را بفرست:",
@@ -4208,7 +4732,7 @@ async def on_suggest_text(update, ctx):
             word=data.get("word"),
             category=data.get("category"),
             description=desc,
-            source="menu"
+            source=data.get("source", "menu")
         )
 
         ctx.user_data.pop("suggest_step", None)
@@ -4267,8 +4791,17 @@ CallbackQueryHandler برای همه‌ی دکمه‌ها، و Menu Button تل�
     export KALEMO_ADMINS="1053046454"
     python main.py
 """
-import logging
 
+import os
+
+import psutil
+import threading
+import time
+
+
+import logging
+import threading
+from web import run
 from telegram import (
     Update, BotCommand, BotCommandScopeAllPrivateChats,
     MenuButtonCommands,
@@ -4282,6 +4815,44 @@ from telegram.ext import (
 import config
 from core import db
 from handlers import menu, admin, lobby, router, namefamily_private, garden
+
+from flask import Flask
+import threading
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    return "Kalemo Bot is alive!", 200
+
+def monitor():
+    p = psutil.Process()
+
+    while True:
+        cpu = p.cpu_percent(interval=1)
+        ram = p.memory_info().rss / 1024 / 1024
+
+        log.info(
+            f"CPU: {cpu:.1f}% | RAM: {ram:.1f} MB"
+        )
+
+        time.sleep(30)
+
+
+def run_web():
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+    )
+
+threading.Thread(target=run_web).start()
+
+
+threading.Thread(
+    target=run,
+    daemon=True
+).start()
 
 logging.basicConfig(
     format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
@@ -4384,8 +4955,16 @@ def build_app() -> Application:
 def main():
     if not config.BOT_TOKEN or config.BOT_TOKEN.startswith("PUT-YOUR"):
         raise SystemExit("⛔️ KALEMO_BOT_TOKEN ست نشده. متغیر محیطی رو تنظیم کن.")
+    threading.Thread(
+        target=run,
+        daemon=True
+    ).start()
     app = build_app()
     log.info("Kalemo is running…")
+    threading.Thread(
+        target=monitor,
+        daemon=True
+    ).start()
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
@@ -4424,9 +5003,11 @@ FILE: config.py
 import os
 from dotenv import load_dotenv
 # توکن ربات (از @BotFather) — حتماً به‌صورت متغیر محیطی ست شود.
+
+
 load_dotenv()
 BOT_TOKEN = os.getenv("KALEMO_BOT_TOKEN")
-
+DATABASE_URL = os.getenv("DATABASE_URL")
 # یوزرنیم ربات (بدون @) — برای لینک افزودن به گروه
 BOT_USERNAME = os.getenv("KALEMO_BOT_USERNAME")
 
@@ -4474,7 +5055,9 @@ FILE: core\db.py
 """
 
 import re
-import sqlite3
+import psycopg
+import os
+import config
 import time
 from contextlib import contextmanager
 from core.garden_db import init_garden
@@ -5101,7 +5684,32 @@ def add_suggestion(user_id, user_name, word, category, description="", source="m
     if not word or not category:
         return False
 
+    if word_exists(category, word):
+        return False
+
     with conn() as c:
+        cat = get_category(category)
+        cat_id = cat["id"] if cat else None
+
+        if cat_id:
+            dup = c.execute(
+                "SELECT 1 FROM words WHERE category_id=? AND normalized_word=? LIMIT 1",
+                (cat_id, normalize_word(word))
+            ).fetchone()
+
+            if dup:
+                return False
+
+        pending = c.execute(
+            """SELECT 1 FROM word_suggestions
+               WHERE category=? AND normalized_word=? 
+               AND status='pending' LIMIT 1""",
+            (category, normalize_word(word))
+        ).fetchone()
+
+        if pending:
+            return False
+
         c.execute("""
             INSERT INTO word_suggestions(
                 user_id, user_name, word, normalized_word,
@@ -5687,16 +6295,14 @@ _AR_FA = str.maketrans({
 })
 # اعراب و علائم کوچک عربی
 _DIACRITICS = re.compile(r"[\u064B-\u0652\u0670\u0640]")
-_SPACES = re.compile(r"\s+")
+_SEPARATORS = re.compile(r"[\s\u200c\u200d\-ـ_]+")
 
 
 def normalize_word(text):
-    s = (text or "").strip()
-    s = s.translate(_AR_FA)
-    s = _DIACRITICS.sub("", s)      # حذف اعراب و کشیده (ـ)
-    s = s.replace("\u200c", "")     # نیم‌فاصله
-    s = s.replace("-", "")
-    s = _SPACES.sub("", s)          # حذف تمام فاصله‌ها
+    """برای مقایسه دقیق واژه‌ها: فاصله، نیم‌فاصله، خط فاصله و کشیده نادیده گرفته می‌شوند."""
+    s = (text or "").strip().translate(_AR_FA)
+    s = _DIACRITICS.sub("", s)
+    s = _SEPARATORS.sub("", s)
     return s.lower()
 ```
 
@@ -6083,7 +6689,10 @@ def profile_view(uid, name):
                 xp_needed=pr.xp_needed(p["level"]), coins=p["coins"],
                 streak=p["streak"], wins=p["wins"], games=p["games"],
                 best=p["best_score"])
-    return cards.profile_card(data)
+    card = cards.profile_card(data)
+    st = db.suggestion_stats_for_user(uid)
+    card += f"\n\n💡 کلمات تاییدشده: <b>{st['approved']}</b>"
+    return card
 
 
 def mission_view(uid):
@@ -6220,44 +6829,65 @@ FILE: game\modes\__init__.py
 """رجیستری مودها (Mode System).
 هر مود یک ماژول مستقل است؛ افزودن مود جدید = ساخت کلاس + یک خط در REGISTRY.
 """
-from .classic import ClassicMode
+"""رجیستری مودها (Mode System)."""
+from .classic import ClassicRandomMode, ClassicChoiceMode
 from .blank import BlankMode
 from .variable import VariableMode
 from .namefamily import NameFamilyMode
 from .clue import ClueMode
 
 # ترتیب نمایش در پنل انتخاب مود
-MODE_ORDER = ["classic", "blank", "namefamily", "variable", "clue"]
+MODE_ORDER = ["classic_random", "classic_choice", "blank", "namefamily", "variable", "clue"]
 
 REGISTRY = {
-    ClassicMode.id: ClassicMode,
+    ClassicRandomMode.id: ClassicRandomMode,
     BlankMode.id: BlankMode,
+    ClassicChoiceMode.id: ClassicChoiceMode,
     VariableMode.id: VariableMode,
     NameFamilyMode.id: NameFamilyMode,
     ClueMode.id: ClueMode,
 }
 
 _META = {
-    "classic":    {"name": "کلاسیک",        "emoji": "🎯",
-                   "desc": "دسته می‌دم، کلمه‌ی مرتبط بگو."},
-    "blank":      {"name": "جای خالی",      "emoji": "🧩",
-                   "desc": "کلمه‌ی ناقص رو کامل کن."},
-    "namefamily": {"name": "اسم‌وفامیل",    "emoji": "✍️",
-                   "desc": "با یک حرف، همه‌ی دسته‌ها رو پر کن."},
-    "variable":   {"name": "قوانین متغیر",  "emoji": "🎲",
-                   "desc": "هر دور قوانین عوض می‌شه."},
-    "clue":       {"name": "سرنخ",          "emoji": "🕵️",
-                   "desc": "از روی سرنخ، جواب رو حدس بزن."},
+    "classic_random": {
+        "name": "کلاسیک رندوم",
+        "emoji": "🎯",
+        "desc": "دسته به‌صورت تصادفی انتخاب می‌شود."
+    },
+    "classic_choice": {
+        "name": "کلاسیک انتخابی",
+        "emoji": "📂",
+        "desc": "سازنده دسته را انتخاب می‌کند."
+    },
+    "blank": {
+        "name": "جای خالی",
+        "emoji": "🧩",
+        "desc": "کلمه‌ی ناقص را کامل کن."
+    },
+    "namefamily": {
+        "name": "اسم‌وفامیل",
+        "emoji": "✍️",
+        "desc": "با یک حرف، دسته‌هارو پر کن."
+    },
+    "variable": {
+        "name": "قوانین متغیر",
+        "emoji": "🎲",
+        "desc": "هر دور قوانین عوض می‌شود."
+    },
+    "clue": {
+        "name": "سرنخ",
+        "emoji": "🕵️",
+        "desc": "از روی سرنخ، جواب را حدس بزن."
+    },
 }
 
-
 def mode_meta(mode_id):
-    m = _META.get(mode_id, _META["classic"])
+    m = _META.get(mode_id, _META["classic_random"])
     return {"id": mode_id, **m}
 
 
 def get_mode_class(mode_id):
-    return REGISTRY.get(mode_id, ClassicMode)
+    return REGISTRY.get(mode_id, ClassicRandomMode)
 
 ```
 
@@ -6399,29 +7029,49 @@ FILE: game\modes\classic.py
 
 ```py
 # -*- coding: utf-8 -*-
-"""مود کلاسیک: یک دسته نمایش داده می‌شود، کاربر کلمه‌ی مرتبط می‌گوید."""
+"""مودهای کلاسیک: رندوم و انتخابی. هر دو فقط با دیتابیس معتبر کار می‌کنند."""
 from .base import BaseMode
 
-class ClassicMode(BaseMode):
-    id = "classic"; name = "کلاسیک"; emoji = "🎯"
+
+class ClassicRandomMode(BaseMode):
+    id = "classic_random"
+    name = "کلاسیک رندوم"
+    emoji = "🎯"
 
     def __init__(self, words, category="", ruleset=None):
         super().__init__(words, ruleset)
         self.category = category
 
     def tutorial(self):
-        return ("🎯 مود کلاسیک\n"
-                "یه دسته بهتون می‌دم؛ کلمه‌ی مرتبط و درست بفرستید.\n"
-                f"📂 دسته: {self.category}\nآماده باشید...")
+        return (
+            f"🎯 <b>کلاسیک رندوم</b>\n"
+            f"دسته: <b>{self.category}</b>\n"
+            "کلمه‌ی مرتبط بفرست."
+        )
 
     def new_question(self):
-        return {"prompt": f"📂 دسته: <b>{self.category}</b>\nیه کلمه‌ی مرتبط بگو!",
-                "answers": {self.norm(w) for w in self.words}}
+        return {
+            "prompt": f"📂 دسته: <b>{self.category}</b>\nکلمه‌ی مرتبط بگو.",
+            "answers": {self.norm(w) for w in self.words},
+        }
 
     def check_answer(self, question, text):
-        if self.norm(text) not in question["answers"]:
-            return False, "نامرتبط"
+        if self.norm(text) not in question.get("answers", set()):
+            return False, "نامعتبر"
         return True, None
+
+
+class ClassicChoiceMode(ClassicRandomMode):
+    id = "classic_choice"
+    name = "کلاسیک انتخابی"
+    emoji = "📂"
+
+    def tutorial(self):
+        return (
+            f"📂 <b>کلاسیک انتخابی</b>\n"
+            f"دسته: <b>{self.category}</b>\n"
+            "کلمه‌ی مرتبط بفرست."
+        )
 ```
 
 
@@ -6520,20 +7170,15 @@ PT_INVALID = 0
 PT_EMPTY = 0
 
 
-NAMEFAMILY_CATEGORIES = ["غذا", "رنگ", "میوه", "حیوان", "اشیا", "عضو بدن", "شهر", "کشور", "شغل"]
 
 
 def load_db_categories(limit=None):
-    """اسم‌وفامیل فقط همین ۹ دسته ثابت را نشان می‌دهد."""
+    """تمام دسته‌بندی‌های دارای کلمه در دیتابیس، بدون نیاز به تغییر کد."""
     from core import db
 
-    if hasattr(db, "seed_namefamily_words"):
-        db.seed_namefamily_words(clean_extra_categories=True)
+    cats = [cat for cat, cnt in db.list_categories() if int(cnt or 0) > 0]
 
-    available = dict(db.list_categories())
-    cats = [cat for cat in NAMEFAMILY_CATEGORIES if int(available.get(cat, 0) or 0) > 0]
-    return cats
-
+    return cats[:limit] if limit else cats
 
 class NameFamilyMode:
     id = "namefamily"
@@ -6977,6 +7622,7 @@ FILE: game\session.py
 import time
 from game.rules import RuleSet
 from game.modes import get_mode_class, mode_meta
+from core.normalize import normalize_word
 
 # گزینه‌های زمان مسابقه (ثانیه) — 0 یعنی نامحدود
 TIME_OPTIONS = [
@@ -7034,7 +7680,18 @@ class Session:
         self.timer_task = None
         # ---- شناسه پیام زنده‌ی بازی ----
         self.live_msg_id = None
+        self.correct_total = 0
+        self.wrong_total = 0
+        self.correct_by_user = {}
+        self.wrong_by_user = {}
+        self.warns = {}
+        self.warns = {}   # uid -> تعداد اخطار در همین بازی
 
+    def add_warn(self, uid):
+        """یک اخطار اضافه می‌کند و تعداد کل اخطارهای کاربر را برمی‌گرداند."""
+        self.warns[uid] = self.warns.get(uid, 0) + 1
+        return self.warns[uid]
+    
     # ---- Join System ----
     def join(self, uid, name):
         if self.state != "lobby":
@@ -7078,7 +7735,7 @@ class Session:
     def build_mode(self):
         cls = get_mode_class(self.mode_id)
         kwargs = {"ruleset": self.ruleset}
-        if self.mode_id == "classic":
+        if self.mode_id in ("classic_random", "classic_choice"):
             kwargs["category"] = self.category
         if self.mode_id == "blank":
             kwargs["difficulty"] = self.difficulty
@@ -7099,16 +7756,48 @@ class Session:
         if uid not in self.players:
             self.players[uid] = {"name": name, "score": 0}
         if nw in self.used:
+            self.wrong_total += 1
+            self.wrong_by_user[uid] = self.wrong_by_user.get(uid, 0) + 1
             return {"ok": False, "reason": "تکراری"}
         ok, reason = self.mode.check_answer(self.question, w)
         if not ok:
+            self.wrong_total += 1
+            self.wrong_by_user[uid] = self.wrong_by_user.get(uid, 0) + 1
             return {"ok": False, "reason": reason}
         self.used.add(nw)
+        self.correct_total += 1
+        self.correct_by_user[uid] = self.correct_by_user.get(uid, 0) + 1
         pts = 10
         if self.ruleset.is_active("bonus"):
             pts += 5
         self.players[uid]["score"] += pts
-        return {"ok": True, "points": pts, "score": self.players[uid]["score"]}
+        return {
+            "ok": True,
+            "points": pts,
+            "score": self.players[uid]["score"],
+            "found": len(self.used),
+            "total": len({normalize_word(w) for w in self.words})
+        }
+    
+    def progress(self):
+        total = len({
+            normalize_word(w)
+            for w in self.words
+            if (w or "").strip()
+        })
+        found = len(self.used)
+        return found, total
+
+
+    def is_completed(self):
+        found, total = self.progress()
+        return total > 0 and found >= total
+
+
+    def add_warn(self, uid):
+        self.warns[uid] = self.warns.get(uid, 0) + 1
+        return self.warns[uid]
+
 
     # ---- زمان ----
     def start_timer(self):
@@ -7149,10 +7838,10 @@ def get(chat_id):
 def exists(chat_id):
     return chat_id in _sessions
 
-def create(chat_id, host_id, host_name, mode_id="classic"):
+def create(chat_id, host_id, host_name, mode_id="classic_random"):
     from game.modes import REGISTRY
     if mode_id not in REGISTRY:
-        mode_id = "classic"
+        mode_id = "classic_random"
     s = Session(chat_id, host_id, host_name)
     s.mode_id = mode_id
     _sessions[chat_id] = s
@@ -7201,7 +7890,7 @@ import asyncio
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
-
+from telegram.error import BadRequest
 import config
 from core import db
 from features import admin_service as adm, player_service as svc
@@ -7283,6 +7972,90 @@ async def on_admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         return await q.message.edit_text(
             "🗂 <b>دسته‌ها</b>\n━━━━━━━━━━━━━━\n" + body,
             parse_mode=HTML, reply_markup=kb.admin_words_menu())
+
+    if action == "suggests":
+        rows = db.pending_suggestions(1)
+
+        if not rows:
+            return await q.message.edit_text(
+                "💡 پیشنهادی در صف بررسی نیست.",
+                reply_markup=kb.admin_back()
+            )
+
+        sug = rows[0]
+
+        text = (
+            "💡 <b>پیشنهاد کلمه</b>\n"
+            "━━━━━━━━━━━━━━\n"
+            f"کلمه: <b>{sug['word']}</b>\n"
+            f"دسته: <b>{sug['category']}</b>\n"
+            f"توضیح: {sug.get('description') or '—'}"
+        )
+
+        return await q.message.edit_text(
+            text,
+            parse_mode=HTML,
+            reply_markup=kb.admin_suggestion_kb(sug["id"])
+        )
+
+    if action == "sapp":
+        sid = int(parts[2])
+        ok, msg = db.approve_suggestion(sid, uid)
+
+        rows = db.pending_suggestions(1)
+
+        if rows:
+            sug = rows[0]
+            text = (
+                "💡 <b>پیشنهاد کلمه</b>\n"
+                "━━━━━━━━━━━━━━\n"
+                f"کلمه: <b>{sug['word']}</b>\n"
+                f"دسته: <b>{sug['category']}</b>\n"
+                f"توضیح: {sug.get('description') or '—'}"
+            )
+
+            return await q.message.edit_text(
+                "✅ " + msg + "\n\n" + text,
+                parse_mode=HTML,
+                reply_markup=kb.admin_suggestion_kb(sug["id"])
+            )
+
+        return await q.message.edit_text(
+            "✅ " + msg + "\n\nدیگه پیشنهادی باقی نمونده.",
+            parse_mode=HTML,
+            reply_markup=kb.admin_back()
+        )
+
+
+    if action == "srej":
+        sid = int(parts[2])
+
+        db.reject_suggestion(sid, uid)
+
+        rows = db.pending_suggestions(1)
+
+        if rows:
+            sug = rows[0]
+            text = (
+                "💡 <b>پیشنهاد کلمه</b>\n"
+                "━━━━━━━━━━━━━━\n"
+                f"کلمه: <b>{sug['word']}</b>\n"
+                f"دسته: <b>{sug['category']}</b>\n"
+                f"توضیح: {sug.get('description') or '—'}"
+            )
+
+            return await q.message.edit_text(
+                "❌ پیشنهاد رد شد.\n\n" + text,
+                parse_mode=HTML,
+                reply_markup=kb.admin_suggestion_kb(sug["id"])
+            )
+
+        return await q.message.edit_text(
+            "❌ پیشنهاد رد شد.\n\nدیگه پیشنهادی باقی نمونده.",
+            parse_mode=HTML,
+            reply_markup=kb.admin_back()
+        )
+
 
     if action == "admins":
         if not adm.is_owner(uid):
@@ -7440,30 +8213,90 @@ DIV = "━━━━━━━━━━━━━━━━"
 def _e(text):
     return html.escape(str(text or ""))
 
+_ART_SEED = r"""
+        .
+       / \
+      /___\
+   ___\___/___
+  /___________\
+"""
+
+_ART_SPROUT = r"""
+        |
+       \|/
+        |
+   _____|_____
+  /___________\
+"""
+
+_ART_SAPLING = r"""
+      \  |  /
+       \ | /
+        \|/
+         |
+         |
+   ______|______
+  /_____________\
+"""
+
+_ART_SMALL = r"""
+       .----.
+    .-'      '-.
+   /    ||      \
+   \    ||      /
+    '-. ||  .-'
+        ||
+        ||
+   _____||_____
+  /____________\
+"""
+
+_ART_TREE = r"""
+       .--------.
+    .-'          '-.
+   /   .------.     \
+  |   /        \     |
+  |   \        /     |
+   \   '------'     /
+    '-.          .-'
+        ||||||
+        ||||||
+   _____||||||_____
+  /________________\
+"""
+
+_ART_FRUIT = r"""
+       .--------.
+    .-'  o  o    '-.
+   /  o  .----.  o  \
+  |     /  oo  \     |
+  |  o  \      /  o  |
+   \  o  '----'  o  /
+    '-.   o  o   .-'
+        ||||||
+        ||||||
+   _____||||||_____
+  /________________\
+"""
 
 def _tree_art(tree):
     if not tree:
-        return "      🌰\n   ───────\n  هنوز بذری کاشته نشده"
+        return _ART_SEED
 
     growth = int(tree.get("growth") or 0)
-    rarity = tree.get("rarity") or "normal"
 
-    if rarity == "golden" and growth >= 80:
-        return "      🌳✨\n    ✨🍃🍃✨\n  🍃🌟🍃🌟🍃\n    ✨│││✨\n      │││"
-    if rarity == "rare" and growth >= 70:
-        return "      🌳💎\n    🍃💠🍃🍃\n  🍃🍃💠🍃🍃\n    🌸🍃🌸\n      │││"
-    if rarity == "blossom" and growth >= 65:
-        return "      🌳🌸\n    🌸🍃🍃🌸\n  🍃🌸🍃🌸🍃\n    🌸│││🌸\n      │││"
-    if growth < 20:
-        return "      🌱\n     ╱ ╲\n    خاک نرم"
-    if growth < 45:
-        return "      🌿\n    🌿🌿\n      │"
-    if growth < 70:
-        return "      🌳\n    🍃🍃🍃\n  🍃🍃🍃🍃\n      ││"
-    if growth < 100:
-        return "      🌳🍃\n    🍃🍃🍃🍃\n  🍃🍃🍃🍃🍃\n    🍃││🍃\n      │││"
-    return "      🌳✨\n    🍃🍃🍃🍃\n  🍃🍃🍃🍃🍃\n    🌸🍃🌸\n      │││"
 
+    if growth >= 100:
+        return _ART_FRUIT
+    if growth >= 80:
+        return _ART_TREE
+    if growth >= 60:
+        return _ART_SMALL
+    if growth >= 40:
+        return _ART_SAPLING
+    if growth >= 20:
+        return _ART_SPROUT
+    return _ART_SEED
 
 def _rarity_label(rarity):
     return {
@@ -7528,11 +8361,21 @@ def garden_card(uid, viewer_uid=None):
 
 def home_kb(uid):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌱 کاشت بذر", callback_data="g:plant"), InlineKeyboardButton("🎁 برداشت", callback_data="g:harvest")],
-        [InlineKeyboardButton("🎒 موجودی بذرها", callback_data="g:inv"), InlineKeyboardButton("👥 باغ دوستان", callback_data="g:friends")],
-        [InlineKeyboardButton("🔄 تازه‌سازی", callback_data="g:home")],
+        [
+            InlineKeyboardButton("🌱 کاشت بذر", callback_data="g:plant"),
+            InlineKeyboardButton("🎁 برداشت", callback_data="g:harvest")
+        ],
+        [
+            InlineKeyboardButton("🎒 موجودی بذرها", callback_data="g:inv"),
+            InlineKeyboardButton("👥 باغ دوستان", callback_data="g:friends")
+        ],
+        [
+            InlineKeyboardButton("📖 راهنمای باغچه", callback_data="g:help")
+        ],
+        [
+            InlineKeyboardButton("🔄 تازه‌سازی", callback_data="g:home")
+        ],
     ])
-
 
 def plant_kb(uid):
     seeds = db.garden_seed_inventory(uid)
@@ -7598,6 +8441,20 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         garden_service.on_daily_garden_visit(user.id)
         await q.answer()
         return await q.message.edit_text(garden_card(user.id, viewer_uid=user.id), parse_mode=HTML, reply_markup=home_kb(user.id))
+
+    if action == "help":
+        await q.answer()
+        text = ("📖 <b>راهنمای باغچه</b>\n" + DIV + "\n"
+                "• با بازی، پاسخ درست و ورود روزانه رشد می‌گیرد.\n"
+                "• هر روز می‌توانی باغ خودت و دوستانت را آبیاری کنی.\n"
+                "• وقتی رشد به ۱۰۰٪ برسد، برداشت فعال می‌شود.\n"
+                "• برداشت می‌تواند Coin، XP، Lucky Box یا بذر بدهد.\n"
+                "• بذرهای بهتر، پاداش جذاب‌تری دارند.")
+        return await q.message.edit_text(
+            text,
+            parse_mode=HTML,
+            reply_markup=home_kb(user.id)
+        )
 
     if action == "plant":
         if len(parts) >= 3:
@@ -7689,8 +8546,19 @@ from core import db
 from features import player_service as svc
 from game import session as sess
 from ui import panels, persona
+import html
+import time
 
 HTML = ParseMode.HTML
+
+import time
+from datetime import timedelta
+from telegram import ChatPermissions
+
+MAX_WARNS = 3                 # سقف اخطار قبل از سکوت
+MUTE_SECONDS = 5 * 60         # مدت سکوت: ۵ دقیقه
+FOCUS_WORD_LIMIT = 3          # بیش از این تعداد کلمه = پیام جمله‌ای
+
 def _arg(parts, i):
     try:
         return parts[i]
@@ -7738,6 +8606,17 @@ async def open_lobby(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_newgame(update, ctx):
+    chat = update.effective_chat
+    u = update.effective_user
+    # اگر بازی فعالی هست: پیام را پاک کن، اخطار بده (مگر معاف)
+    if chat.type in ("group", "supergroup") and sess.exists(chat.id):
+        s = sess.get(chat.id)
+        if await _is_privileged(ctx, s, chat.id, u.id):
+            return await update.message.reply_text(
+                "⚠️ یه مسابقه فعاله! اول «🏁 پایان» یا /endgame.")
+        await _safe_delete(update.message)
+        return await _warn_and_maybe_mute(
+            ctx, s, chat.id, u, "وقتی بازی فعاله نمی‌تونی بازی جدید بزنی")
     return await open_lobby(update, ctx)
 
 
@@ -7745,8 +8624,12 @@ async def cmd_endgame(update, ctx):
     chat = update.effective_chat
     if not sess.exists(chat.id):
         return await update.message.reply_text("الان مسابقه‌ای در جریان نیست.")
+    s = sess.get(chat.id)
+    u = update.effective_user
+    if not await _is_privileged(ctx, s, chat.id, u.id):
+        return await update.message.reply_text(
+            "⛔️ فقط سازنده‌ی بازی یا ادمین‌های گروه می‌تونن بازی رو تموم کنن.")
     await _finish(ctx, chat.id)
-
 
 async def cmd_settings(update, ctx):
     chat = update.effective_chat
@@ -7760,15 +8643,79 @@ async def cmd_settings(update, ctx):
                                     reply_markup=panels.settings_kb(s))
 
 
+# ---------- بررسی ادمین بودن در گروه تلگرام ----------
+async def _is_group_admin(ctx, chat_id, uid):
+    try:
+        m = await ctx.bot.get_chat_member(chat_id, uid)
+        return m.status in ("administrator", "creator")
+    except Exception:
+        return False
+
+
+async def _is_privileged(ctx, s, chat_id, uid):
+    """سازنده‌ی بازی یا ادمین گروه؟ (این‌ها از همه‌ی قوانین معاف‌اند)"""
+    if s and uid == s.host_id:
+        return True
+    return await _is_group_admin(ctx, chat_id, uid)
+
+
+async def _safe_delete(msg):
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+
+async def _warn_and_maybe_mute(ctx, s, chat_id, u, reason_text):
+    """
+    یک اخطار ثبت می‌کند؛ در اخطار سوم کاربر را ۵ دقیقه سکوت می‌کند.
+    یک پیام کوتاه (خوداتخریب) در گروه می‌فرستد.
+    """
+    n = s.add_warn(u.id)
+    name = u.first_name or "کاربر"
+
+    if n >= MAX_WARNS:
+        muted = False
+        try:
+            await ctx.bot.restrict_chat_member(
+                chat_id, u.id,
+                permissions=ChatPermissions(can_send_messages=False),
+                until_date=int(time.time()) + MUTE_SECONDS,
+            )
+            muted = True
+        except Exception:
+            muted = False
+        # اخطارها را برای شروع دوباره صفر کن تا بعد از سکوت از نو شمرده شود
+        s.warns[u.id] = 0
+        if muted:
+            txt = (f"🔇 <a href=\"tg://user?id={u.id}\">{name}</a> "
+                   f"به‌خاطر تکرار تخلف ۵ دقیقه سکوت شد.")
+        else:
+            txt = (f"⚠️ <a href=\"tg://user?id={u.id}\">{name}</a> به سقف اخطار رسید، "
+                   f"ولی ربات دسترسی «محدودکردن اعضا» ندارد.")
+    else:
+        left = MAX_WARNS - n
+        txt = (f"⚠️ <a href=\"tg://user?id={u.id}\">{name}</a> {reason_text} "
+               f"(اخطار {n}/{MAX_WARNS} — {left} اخطار تا سکوت)")
+
+    try:
+        note = await ctx.bot.send_message(chat_id, txt, parse_mode=HTML)
+        # پیام هشدار را بعد از ۵ ثانیه پاک کن تا گروه شلوغ نشود
+        ctx.job_queue.run_once(
+            lambda c: c.bot.delete_message(chat_id, note.message_id),
+            5, name=f"delwarn:{chat_id}:{note.message_id}")
+    except Exception:
+        pass
+
 # ---------- بررسی دسترسی سازنده ----------
 def _host_only(s, uid):
     return uid == s.host_id
 
 
+
 HOST_ACTIONS = {"mode", "setmode", "rules", "toggle", "time", "settime",
-                "diff", "setdiff", "start", "cancel", "focus", "end"}
-
-
+                "diff", "setdiff", "cat", "catpage", "setcat",
+                "start", "cancel", "focus", "end"}
 # ---------- callbackها ----------
 async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -7810,6 +8757,38 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if not s.set_mode(mid):
             return await q.answer("مود نامعتبر است.", show_alert=True)
         await q.answer(f"مود شد: {s.mode_name()}")
+        return await _refresh_lobby(q, s)
+    
+    if action == "cat":
+        cats = db.list_categories()
+        await q.answer()
+        return await q.message.edit_text(
+            panels.category_text(),
+            parse_mode=HTML,
+            reply_markup=panels.category_kb(cats, s.category),
+        )
+
+    if action == "catpage":
+        page = int(_arg(parts, 2) or 0)
+        cats = db.list_categories()
+        await q.answer()
+        return await q.message.edit_text(
+            panels.category_text(),
+            parse_mode=HTML,
+            reply_markup=panels.category_kb(cats, s.category, page=page),
+        )    
+
+    if action == "setcat":
+        page = int(_arg(parts, 2) or 0)
+        cat = ":".join(parts[3:]).strip()
+
+        if not cat or not db.get_category(cat):
+            return await q.answer("دسته نامعتبر است.", show_alert=True)
+
+        s.category = cat
+        s.words = db.list_words(cat) or []
+
+        await q.answer("دسته انتخاب شد.")
         return await _refresh_lobby(q, s)
 
     if action == "time":
@@ -7872,14 +8851,20 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if action == "start":
         if s.count() < 2:
             return await q.answer("حداقل دو بازیکن برای شروع لازم است.", show_alert=True)
+        if not _load_category_for_session(s):
+            return await q.answer(
+                "برای این مود دسته/کلمه کافی نیست.",
+                show_alert=True,
+            )
         await q.answer()
         return await _start_countdown(q, ctx, s)
 
     if action == "end":
+        if not await _is_privileged(ctx, s, chat_id, u.id):
+            return await q.answer(
+                "فقط سازنده یا ادمین گروه می‌تونه پایان بده.", show_alert=True)
         await q.answer()
         return await _finish(ctx, chat_id)
-    await q.answer("دستور ناشناخته", show_alert=True)
-    return
 
 async def _refresh_lobby(q, s):
     try:
@@ -7893,6 +8878,17 @@ async def _refresh_lobby(q, s):
 async def _start_countdown(q, ctx, s):
     s.state = "countdown"
     msg = q.message
+    mentions = _player_mentions(s)
+
+    if mentions:
+        try:
+            await ctx.bot.send_message(
+                s.chat_id,
+                "شروع مسابقه:\n" + mentions,
+                parse_mode=HTML,
+            )
+        except Exception:
+            pass
     s.live_msg_id = msg.message_id
     for n in (3, 2, 1):
         try:
@@ -8057,24 +9053,10 @@ async def _finish(ctx, chat_id, reason=None):
                 f"🎁 <b>{info['name']}</b> یک Lucky Box گرفت: {lucky_box.item_text(item)}"
             )
 
-    body = "\n".join(lines) if lines else "کسی امتیازی نگرفت 😅"
-    head = "⏰ <b>وقت تموم شد!</b>\n\n" if reason == "time" else ""
-    text = (f"{head}{persona.say('game_end')}\n\n"
-            f"🏁 <b>نتایج — {s.mode_name()}</b>\n"
-            f"{panels.DIV}\n{body}")
-
+    text = panels.finish_text(s, reason=reason) 
     if box_lines:
         text += "\n\n🎁 <b>Lucky Box</b>\n" + "\n".join(box_lines)
 
-    # پیام زنده را به کارت نتایج تبدیل کن
-    if s.live_msg_id:
-        try:
-            await ctx.bot.edit_message_text(
-                chat_id=chat_id, message_id=s.live_msg_id, text=text,
-                parse_mode=HTML)
-            return
-        except Exception:
-            pass
     await ctx.bot.send_message(chat_id, text, parse_mode=HTML)
 
 
@@ -8096,28 +9078,116 @@ async def on_group_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if s.is_round_based():
         return False
 
+    if _suggestion_hint(text):
+        return await _handle_group_suggestion(update, ctx, s, text)
+
     # --- مودهای سوال‌محور ---
     res = s.submit(u.id, nm, text)
     if res and res["ok"]:
-        await msg.reply_text(persona.say("good_answer", pts=res["points"])
-                             + f"  (مجموع: {res['score']})")
+        found, total = s.progress()
+
+        await msg.reply_text(
+            panels.answer_ok_text(
+                res["score"],
+                found,
+                total,
+            )
+        )
+
+        if s.is_completed():
+            await _finish(ctx, chat.id, reason="completed")
+            return True
+
         s.next_question()
         await _update_live(ctx, s)
+
+
         return True
-    return await _maybe_focus(s, msg, text, is_answer=res is not None)
+    return await _maybe_focus(ctx, s, msg, text, u, is_answer=res is not None)
+
+async def _maybe_focus(ctx, s, msg, text, u, is_answer):
+    if not s.focus_mode:
+        return False
+    too_long = len(text.split()) > FOCUS_WORD_LIMIT
+    if is_answer or not too_long:
+        return False
+    # سازنده و ادمین‌های گروه معاف‌اند
+    if await _is_privileged(ctx, s, s.chat_id, u.id):
+        return False
+    await _safe_delete(msg)
+    await _warn_and_maybe_mute(
+        ctx, s, s.chat_id, u, "حین بازی فقط جواب بده، نه جمله")
+    return True
 
 
-async def _maybe_focus(s, msg, text, is_answer):
-    if s.focus_mode:
-        too_long = len(text.split()) > 3
-        if (not is_answer) and too_long:
-            try:
-                await msg.delete()
-            except Exception:
-                pass
-            return True
-    return False
+async def handle_start_during_game(update, ctx):
+    chat = update.effective_chat
+    u = update.effective_user
+    s = sess.get(chat.id)
+    if not s:
+        return await open_lobby(update, ctx)
+    if await _is_privileged(ctx, s, chat.id, u.id):
+        return await update.message.reply_text(
+            "⚠️ یه مسابقه فعاله! اول «🏁 پایان» یا /endgame.")
+    await _safe_delete(update.message)
+    return await _warn_and_maybe_mute(
+        ctx, s, chat.id, u, "وقتی بازی فعاله نمی‌تونی بازی جدید شروع کنی")
 
+def _load_category_for_session(s):
+    if s.mode_id == "classic_choice" and not s.category:
+        return False
+    if not s.category:
+        cat = db.random_category()
+        if not cat:
+            return False
+        s.category = cat
+    s.words = db.list_words(s.category) or []
+    return bool(s.words) or s.is_round_based()
+
+def _player_mentions(s):
+    return " ".join(
+        f'<a href="tg://user?id={uid}">{html.escape(info.get("name") or "بازیکن")}</a>'
+        for uid, info in s.players.items()
+    )
+
+def _suggestion_hint(text):
+    t = (text or "").strip()
+    return (
+        t.startswith("+کلمه")
+        or t.startswith("پیشنهاد کلمه")
+        or t.startswith("/suggest")
+    )
+
+async def _handle_group_suggestion(update, ctx, s, text):
+    from features import suggestion_service as ss
+
+    raw = text.strip()
+
+    for prefix in ("+کلمه", "پیشنهاد کلمه", "/suggest"):
+        if raw.startswith(prefix):
+            raw = raw[len(prefix):].strip()
+            break
+
+    parts = [p.strip() for p in raw.split("|")]
+
+    if len(parts) < 2:
+        return await update.message.reply_text(
+            "فرمت: +کلمه کلمه | دسته | توضیح اختیاری"
+        )
+
+    u = update.effective_user
+
+    ok, msg = ss.create(
+        u.id,
+        u.first_name,
+        parts[0],
+        parts[1],
+        parts[2] if len(parts) > 2 else "",
+        source="game",
+    )
+
+    await update.message.reply_text(("✅ " if ok else "⚠️ ") + msg)
+    return True
 ```
 
 
@@ -8269,6 +9339,18 @@ async def on_menu(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                "🎯 هر روز یه مأموریت تازه و جایزه‌ی ورود.\n"
                "🔥 هر روز سر بزن تا استریکت نپره!")
         return await q.message.edit_text(txt, parse_mode=HTML, reply_markup=kb.play_in_group())
+
+    if action == "garden":
+        from handlers import garden as garden_handlers
+        return await garden_handlers.open_garden(update, ctx)
+
+    if action == "suggest":
+        from handlers import suggestions
+        return await suggestions.start_suggest(update, ctx)
+
+    if action == "garden":
+        from handlers import garden as garden_handlers
+        return await garden_handlers.open_garden(update, ctx)
 
     if action == "play":
         return await q.message.edit_text(
@@ -8530,8 +9612,22 @@ FILE: requirements.txt
 ================================================================================
 
 ```txt
-python-telegram-bot>=21.0
+python-telegram-bot==21.7
+python-dotenv==1.0.1
+httpx==0.27.2
+flask
+psutil
+psycopg[binary]
+SQLAlchemy
+```
 
+
+================================================================================
+FILE: runtime.txt
+================================================================================
+
+```txt
+python-3.12.7
 ```
 
 
@@ -9137,6 +10233,8 @@ import config
 def main_menu():
     return M([
         [B("🎮 ایجاد بازی", callback_data="m:play")],
+        [B("🌳 باغچه", callback_data="m:garden"),
+         B("💡 پیشنهاد کلمه", callback_data="m:suggest")],
         [B("👤 پروفایل", callback_data="m:profile"),
          B("🎯 ماموریت روزانه", callback_data="m:mission")],
         [B("🏆 لیدربورد", callback_data="m:lb"),
@@ -9144,7 +10242,6 @@ def main_menu():
         [B("⚙ تنظیمات", callback_data="m:settings"),
          B("❓ راهنما", callback_data="m:help")],
     ])
-
 
 def back_menu():
     return M([[B("🔙 منوی اصلی", callback_data="m:home")]])
@@ -9208,9 +10305,29 @@ def admin_back():
 def admin_words_menu():
     return M([
         [B("📋 لیست دسته‌ها", callback_data="a:wlist")],
+        [B("💡 پیشنهادها", callback_data="a:suggests")],
         [B("🔙 پنل ادمین", callback_data="a:home")],
     ])
-
+def suggest_menu():
+    return M([
+        [B("💡 ثبت پیشنهاد", callback_data="m:suggest")],
+        [B("🔙 منوی اصلی", callback_data="m:home")],
+    ])
+def admin_suggestion_kb(sid):
+    return M([
+        [
+            B("✅ تایید", callback_data=f"a:sapp:{sid}"),
+            B("❌ رد", callback_data=f"a:srej:{sid}")
+        ],
+        [
+            B("✏️ ویرایش", callback_data=f"a:sedit:{sid}"),
+            B("📂 تغییر دسته", callback_data=f"a:scat:{sid}")
+        ],
+        [
+            B("➡ بعدی", callback_data="a:suggests"),
+            B("🔙 پنل ادمین", callback_data="a:home")
+        ],
+    ])
 ```
 
 
@@ -9354,9 +10471,19 @@ def live_text(s):
     leader = s.leader()
     leader_line = (f"🥇 صدرنشین: <b>{leader[0]}</b> — {leader[1]} امتیاز"
                    if leader else "🥇 صدرنشین: —")
-    cat_line = f"📂 دسته: <b>{s.category}</b>\n" if s.category and s.mode_id in ("classic",) else ""
+    cat_line = (
+        f"📂 دسته: <b>{s.category}</b>\n"
+        if s.category and s.mode_id in ("classic_random", "classic_choice", "variable")
+        else ""
+    )
+
     rules_line = ""
-    if s.ruleset.rules and s.mode_id in ("classic", "blank"):
+    if s.ruleset.rules and s.mode_id in (
+        "classic_random",
+        "classic_choice",
+        "blank",
+    ):
+
         rules_line = f"📜 قوانین:\n{s.ruleset.describe()}\n"
     return (
         f"🎮 <b>مسابقه‌ی کلمو — {meta['emoji']} {meta['name']}</b>\n"
@@ -9393,6 +10520,115 @@ def settings_kb(s):
     return M([[B(label, callback_data="k:focus")],
              [B("🔙 برگشت", callback_data="k:back")]])
 
+
+def category_text():
+    return (
+        "📂 <b>انتخاب دسته</b>\n"
+        + DIV +
+        "\nیک دسته برای مسابقه انتخاب کن."
+    )
+
+def category_kb(categories, current=None, page=0, per_page=8):
+    total = len(categories)
+    start = page * per_page
+    shown = categories[start:start + per_page]
+
+    rows = []
+
+    for cat, cnt in shown:
+        mark = "◉" if cat == current else "◯"
+        rows.append([
+            B(
+                f"{mark} {cat} ({cnt})",
+                callback_data=f"k:setcat:{page}:{cat}"
+            )
+        ])
+
+    nav = []
+
+    if page > 0:
+        nav.append(
+            B("⬅ قبلی", callback_data=f"k:catpage:{page-1}")
+        )
+
+    if start + per_page < total:
+        nav.append(
+            B("بعدی ➡", callback_data=f"k:catpage:{page+1}")
+        )
+
+    if nav:
+        rows.append(nav)
+
+    rows.append([
+        B("🔙 برگشت", callback_data="k:back")
+    ])
+
+    return M(rows)
+
+def answer_ok_text(score, found, total):
+    total = max(1, int(total or 0))
+    found = max(0, min(int(found or 0), total))
+
+    pct = round(found * 100 / total)
+
+    filled = round(pct / 100 * 16)
+
+    bar = (
+        "█" * filled +
+        "░" * (16 - filled)
+    )
+
+    return (
+        f"✅ درست\n"
+        f"⭐ امتیاز: {score}\n\n"
+        f"{bar} {pct}%\n\n"
+        f"{found} / {total}"
+    )
+
+
+def finish_text(s, reason=None):
+    import html
+    import time
+
+    ranking = s.ranking()
+
+    duration = 0
+    if s.started_at:
+        duration = max(
+            0,
+            int(time.time() - s.started_at)
+        )
+
+    m, sec = divmod(duration, 60)
+
+    lines = [
+        "🏆 <b>رتبه‌بندی</b>",
+        DIV,
+    ]
+
+    if not ranking:
+        lines.append("امتیازی ثبت نشد.")
+
+    for i, (uid, info) in enumerate(ranking, 1):
+        name = html.escape(
+            info.get("name", "بازیکن")
+        )
+
+        score = int(info.get("score", 0))
+        ok = int(s.correct_by_user.get(uid, 0))
+        bad = int(s.wrong_by_user.get(uid, 0))
+
+        lines.append(f"{i}. <b>{name}</b>")
+        lines.append(f"⭐ امتیاز: {score}")
+        lines.append(f"📊 درست: {ok}   ❌ اشتباه: {bad}")
+
+    lines += [
+        DIV,
+        f"⏱ مدت مسابقه: <b>{m:02d}:{sec:02d}</b>",
+        f"📂 دسته مسابقه: <b>{html.escape(s.category or '—')}</b>",
+    ]
+
+    return "\n".join(lines)
 ```
 
 
@@ -9467,5 +10703,27 @@ def say(key, **kwargs):
     except (KeyError, IndexError):
         return text
 
+```
+
+
+================================================================================
+FILE: web.py
+================================================================================
+
+```py
+from flask import Flask
+import os
+
+app = Flask(__name__)
+
+@app.route("/")
+def home():
+    return "Kalemo Bot is alive!", 200
+
+def run():
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+    )
 ```
 

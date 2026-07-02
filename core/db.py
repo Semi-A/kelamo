@@ -1,50 +1,104 @@
 # -*- coding: utf-8 -*-
-"""لایه دیتابیس Kalemo.
+"""لایه دیتابیس Kalemo — نسخه‌ی PostgreSQL.
 
-شامل:
-- بازیکنان و نام نمایشی
-- ماموریت‌های روزانه
-- دسته‌بندی و کلمات (با نرمال‌سازی برای مقایسه)
-- پیشنهاد کلمات توسط کاربران
-- گزارش مسابقات
-- لاگ تغییرات ادمین
-- Lucky Box
-- ادمین‌های همکار
+این فایل جایگزین نسخه‌ی SQLite است. تمام امضاهای توابع عمومی (public API)
+دقیقاً مثل قبل باقی مانده‌اند، بنابراین هیچ فایل دیگری در پروژه نیازی به
+تغییر ندارد. فقط لایه‌ی ذخیره‌سازی از SQLite به PostgreSQL منتقل شده است.
+
+نکات مهاجرت:
+- به‌جای sqlite3 از psycopg (نسخه ۳) استفاده می‌شود.
+- کانکشن از طریق یک ConnectionPool مدیریت می‌شود (مناسب پلن رایگان Render).
+- placeholder پارامترها از «?» به «%s» تغییر کرده است.
+- AUTOINCREMENT → GENERATED / SERIAL (اینجا از GENERATED ALWAYS AS IDENTITY).
+- lastrowid → INSERT ... RETURNING id.
+- INSERT OR IGNORE → INSERT ... ON CONFLICT DO NOTHING.
+- executescript → execute (psycopg چند دستور را در یک رشته اجرا می‌کند).
+- خطای یکتایی sqlite3.IntegrityError → psycopg.errors.UniqueViolation.
+- PRAGMA table_info → information_schema.columns.
 """
 
-import re
-import sqlite3
 import time
 from contextlib import contextmanager
-from core.garden_db import init_garden
-import config
 
-DB_PATH = config.DB_PATH
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+import config
+from core.garden_db import init_garden
+
+# سازگاری عقب‌رو: هر جای پروژه که db.IntegrityError را می‌گیرد کار کند.
+IntegrityError = psycopg.errors.UniqueViolation
+
+# ---------- connection pool ----------
+# روی پلن رایگان Render تعداد کانکشن‌ها محدود است؛ pool کوچک نگه داشته می‌شود.
+_DSN = config.DATABASE_URL
+if not _DSN:
+    raise RuntimeError(
+        "DATABASE_URL تنظیم نشده است. در Render → Environment مقدار "
+        "Internal Database URL دیتابیس PostgreSQL را ست کنید."
+    )
+
+_pool = ConnectionPool(
+    conninfo=_DSN,
+    min_size=1,
+    max_size=int(config.DB_POOL_MAX),
+    kwargs={"row_factory": dict_row, "autocommit": False},
+    open=True,
+)
 
 
 @contextmanager
 def conn():
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield c
-        c.commit()
-    finally:
-        c.close()
+    """یک کانکشن از pool می‌گیرد، cursor با دسترسی مثل dict برمی‌گرداند.
+
+    برای حفظ سازگاری با کد قدیمی، شیءِ yield شده یک wrapper است که
+    متد execute() آن یک cursor برمی‌گرداند (دقیقاً مثل sqlite3.Connection.execute).
+    """
+    with _pool.connection() as c:
+        try:
+            yield _ConnShim(c)
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+
+
+class _ConnShim:
+    """سازگاری با API قدیمی sqlite3.
+
+    در sqlite3، connection.execute(sql, params) خودش یک cursor برمی‌گرداند
+    که می‌شود روی آن fetchone/fetchall/rowcount صدا زد. اینجا همان رفتار را
+    شبیه‌سازی می‌کنیم تا کوئری‌های موجود بدون تغییر کار کنند.
+    """
+
+    def __init__(self, real_conn):
+        self._c = real_conn
+
+    def execute(self, sql, params=()):
+        # ترجمه‌ی خودکار placeholder «?» به «%s» تا کوئری‌ها دست‌نخورده بمانند.
+        if "?" in sql:
+            sql = sql.replace("?", "%s")
+        cur = self._c.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def cursor(self):
+        return self._c.cursor()
 
 
 # ---------- normalization ----------
-
-# ---------- normalization ----------
-from core.normalize import normalize_word  # noqa: F401  (سازگاری عقب‌رو)
+from core.normalize import normalize_word  # noqa: E402,F401  (سازگاری عقب‌رو)
 
 
 # ---------- schema helpers ----------
 
 def _table_columns(c, table):
-    rows = c.execute(f"PRAGMA table_info({table})").fetchall()
-    return {r["name"] for r in rows}
+    rows = c.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name=%s",
+        (table,),
+    ).fetchall()
+    return {r["column_name"] for r in rows}
 
 
 def _ensure_column(c, table, column, ddl):
@@ -54,12 +108,13 @@ def _ensure_column(c, table, column, ddl):
 
 def init():
     with conn() as c:
-        c.executescript("""
+        # در PostgreSQL کلید افزایشی با IDENTITY ساخته می‌شود.
+        c.execute("""
         CREATE TABLE IF NOT EXISTS players (
-            user_id         INTEGER PRIMARY KEY,
+            user_id         BIGINT PRIMARY KEY,
             name            TEXT,
             display_name    TEXT,
-            name_changed_at INTEGER DEFAULT 0,
+            name_changed_at BIGINT DEFAULT 0,
             level           INTEGER DEFAULT 1,
             xp              INTEGER DEFAULT 0,
             coins           INTEGER DEFAULT 0,
@@ -70,11 +125,11 @@ def init():
             best_score      INTEGER DEFAULT 0,
             onboarded       INTEGER DEFAULT 0,
             accepted_words  INTEGER DEFAULT 0,
-            created_at      INTEGER
+            created_at      BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS mission_progress (
-            user_id   INTEGER,
+            user_id   BIGINT,
             day       TEXT,
             progress  INTEGER DEFAULT 0,
             claimed   INTEGER DEFAULT 0,
@@ -82,12 +137,12 @@ def init():
         );
 
         CREATE TABLE IF NOT EXISTS categories (
-            id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            id    INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             name  TEXT UNIQUE
         );
 
         CREATE TABLE IF NOT EXISTS words (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            id              INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             category_id     INTEGER NOT NULL,
             word            TEXT NOT NULL,
             normalized_word TEXT DEFAULT '',
@@ -97,21 +152,21 @@ def init():
             synonyms        TEXT DEFAULT '',
             clue            TEXT DEFAULT '',
             usage_count     INTEGER DEFAULT 0,
-            last_used_by    INTEGER,
-            last_used_at    INTEGER,
+            last_used_by    BIGINT,
+            last_used_at    BIGINT,
             UNIQUE(category_id, word),
             FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS admins (
-            user_id  INTEGER PRIMARY KEY,
-            added_by INTEGER,
-            added_at INTEGER
+            user_id  BIGINT PRIMARY KEY,
+            added_by BIGINT,
+            added_at BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS word_suggestions (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id         INTEGER,
+            id              INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            user_id         BIGINT,
             user_name       TEXT,
             word            TEXT NOT NULL,
             normalized_word TEXT DEFAULT '',
@@ -119,46 +174,46 @@ def init():
             description     TEXT DEFAULT '',
             source          TEXT DEFAULT 'menu',
             status          TEXT DEFAULT 'pending',
-            admin_id        INTEGER,
+            admin_id        BIGINT,
             admin_note      TEXT DEFAULT '',
-            created_at      INTEGER,
-            reviewed_at     INTEGER
+            created_at      BIGINT,
+            reviewed_at     BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS match_reports (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id     INTEGER,
+            id          INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            chat_id     BIGINT,
             mode        TEXT,
-            winner_id   INTEGER,
+            winner_id   BIGINT,
             players     INTEGER DEFAULT 0,
-            created_at  INTEGER
+            created_at  BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS change_logs (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id    INTEGER,
+            id          INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            admin_id    BIGINT,
             action      TEXT,
             target_type TEXT,
             target_id   TEXT,
             detail      TEXT,
-            created_at  INTEGER
+            created_at  BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS lucky_boxes (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     INTEGER,
-            match_id    INTEGER,
+            id          INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            user_id     BIGINT,
+            match_id    BIGINT,
             item_type   TEXT,
             item_value  TEXT,
             rarity      TEXT,
             opened      INTEGER DEFAULT 1,
-            created_at  INTEGER
+            created_at  BIGINT
         );
         """)
 
         # ---- migrations برای دیتابیس‌های قدیمی ----
         _ensure_column(c, "players", "display_name", "display_name TEXT")
-        _ensure_column(c, "players", "name_changed_at", "name_changed_at INTEGER DEFAULT 0")
+        _ensure_column(c, "players", "name_changed_at", "name_changed_at BIGINT DEFAULT 0")
         _ensure_column(c, "players", "accepted_words", "accepted_words INTEGER DEFAULT 0")
 
         _ensure_column(c, "words", "difficulty", "difficulty INTEGER DEFAULT 1")
@@ -168,27 +223,28 @@ def init():
         _ensure_column(c, "words", "clue", "clue TEXT DEFAULT ''")
         _ensure_column(c, "words", "normalized_word", "normalized_word TEXT DEFAULT ''")
         _ensure_column(c, "words", "usage_count", "usage_count INTEGER DEFAULT 0")
-        _ensure_column(c, "words", "last_used_by", "last_used_by INTEGER")
-        _ensure_column(c, "words", "last_used_at", "last_used_at INTEGER")
+        _ensure_column(c, "words", "last_used_by", "last_used_by BIGINT")
+        _ensure_column(c, "words", "last_used_at", "last_used_at BIGINT")
 
         c.execute("UPDATE words SET normalized_word='' WHERE normalized_word IS NULL")
 
         rows = c.execute("SELECT id, word FROM words WHERE normalized_word=''").fetchall()
         for r in rows:
             c.execute(
-                "UPDATE words SET normalized_word=? WHERE id=?",
-                (normalize_word(r["word"]), r["id"])
+                "UPDATE words SET normalized_word=%s WHERE id=%s",
+                (normalize_word(r["word"]), r["id"]),
             )
 
         c.execute("CREATE INDEX IF NOT EXISTS ix_words_normalized ON words(category_id, normalized_word)")
         c.execute("CREATE INDEX IF NOT EXISTS ix_suggestions_status ON word_suggestions(status)")
 
+        # partial unique index (نحو یکسان در Postgres)
         c.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS ux_players_display_name
         ON players(display_name)
         WHERE display_name IS NOT NULL AND TRIM(display_name) <> ''
         """)
-        
+
         init_garden(c)
 
     seed_defaults()
@@ -199,7 +255,7 @@ def init():
 
 def get_player(uid):
     with conn() as c:
-        r = c.execute("SELECT * FROM players WHERE user_id=?", (uid,)).fetchone()
+        r = c.execute("SELECT * FROM players WHERE user_id=%s", (uid,)).fetchone()
     return dict(r) if r else None
 
 
@@ -212,13 +268,14 @@ def ensure_player(uid, name):
     if p:
         if name and p.get("name") != name:
             with conn() as c:
-                c.execute("UPDATE players SET name=? WHERE user_id=?", (name, uid))
+                c.execute("UPDATE players SET name=%s WHERE user_id=%s", (name, uid))
         return get_player(uid)
 
     with conn() as c:
         c.execute(
-            "INSERT INTO players(user_id, name, created_at) VALUES (?, ?, ?)",
-            (uid, name or "", int(time.time()))
+            "INSERT INTO players(user_id, name, created_at) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id) DO NOTHING",
+            (uid, name or "", int(time.time())),
         )
     return get_player(uid)
 
@@ -233,10 +290,10 @@ def save_player(uid, **fields):
         if bad:
             raise ValueError(f"Invalid player field(s): {', '.join(bad)}")
 
-        cols = ", ".join(f"{k}=?" for k in fields)
+        cols = ", ".join(f"{k}=%s" for k in fields)
         values = list(fields.values())
         values.append(uid)
-        c.execute(f"UPDATE players SET {cols} WHERE user_id=?", values)
+        c.execute(f"UPDATE players SET {cols} WHERE user_id=%s", values)
 
 
 def is_onboarded(uid):
@@ -274,13 +331,13 @@ def is_display_name_taken(name, exclude_uid=None):
     with conn() as c:
         if exclude_uid is None:
             r = c.execute(
-                "SELECT 1 FROM players WHERE display_name=? LIMIT 1",
-                (name,)
+                "SELECT 1 FROM players WHERE display_name=%s LIMIT 1",
+                (name,),
             ).fetchone()
         else:
             r = c.execute(
-                "SELECT 1 FROM players WHERE display_name=? AND user_id<>? LIMIT 1",
-                (name, exclude_uid)
+                "SELECT 1 FROM players WHERE display_name=%s AND user_id<>%s LIMIT 1",
+                (name, exclude_uid),
             ).fetchone()
     return r is not None
 
@@ -295,13 +352,13 @@ def set_display_name(uid, name):
         raise ValueError("display name cannot be empty")
 
     if is_display_name_taken(name, exclude_uid=uid):
-        raise sqlite3.IntegrityError("display name already taken")
+        raise IntegrityError("display name already taken")
 
     ensure_player(uid, "")
     with conn() as c:
         c.execute(
-            "UPDATE players SET display_name=?, name_changed_at=? WHERE user_id=?",
-            (name, int(time.time()), uid)
+            "UPDATE players SET display_name=%s, name_changed_at=%s WHERE user_id=%s",
+            (name, int(time.time()), uid),
         )
 
 
@@ -320,8 +377,8 @@ def stats():
 def get_mission_progress(uid, day):
     with conn() as c:
         r = c.execute(
-            "SELECT * FROM mission_progress WHERE user_id=? AND day=?",
-            (uid, day)
+            "SELECT * FROM mission_progress WHERE user_id=%s AND day=%s",
+            (uid, day),
         ).fetchone()
     return dict(r) if r else {"user_id": uid, "day": day, "progress": 0, "claimed": 0}
 
@@ -330,9 +387,9 @@ def bump_mission(uid, day, amount=1):
     with conn() as c:
         c.execute("""
         INSERT INTO mission_progress(user_id, day, progress)
-        VALUES (?, ?, ?)
+        VALUES (%s, %s, %s)
         ON CONFLICT(user_id, day)
-        DO UPDATE SET progress = progress + ?
+        DO UPDATE SET progress = mission_progress.progress + %s
         """, (uid, day, amount, amount))
 
 
@@ -340,10 +397,11 @@ def claim_mission(uid, day):
     with conn() as c:
         c.execute("""
         INSERT INTO mission_progress(user_id, day, claimed)
-        VALUES (?, ?, 1)
+        VALUES (%s, %s, 1)
         ON CONFLICT(user_id, day)
         DO UPDATE SET claimed = 1
         """, (uid, day))
+
 
 def claim_mission_atomic(uid, day, coins, xp):
     """اتمیک: اگر قبلاً claim نشده، claim را ثبت و سکه/XP را اعمال می‌کند.
@@ -351,20 +409,19 @@ def claim_mission_atomic(uid, day, coins, xp):
     from core.progression import add_xp
     with conn() as c:
         row = c.execute(
-            "SELECT claimed FROM mission_progress WHERE user_id=? AND day=?",
+            "SELECT claimed FROM mission_progress WHERE user_id=%s AND day=%s",
             (uid, day)).fetchone()
         if row and row["claimed"]:
             return False
-        # ثبت claim (اتمیک در همین تراکنش)
         c.execute("""INSERT INTO mission_progress(user_id, day, claimed)
-                     VALUES (?, ?, 1)
+                     VALUES (%s, %s, 1)
                      ON CONFLICT(user_id, day) DO UPDATE SET claimed=1""",
                   (uid, day))
-        p = c.execute("SELECT level, xp, coins FROM players WHERE user_id=?",
+        p = c.execute("SELECT level, xp, coins FROM players WHERE user_id=%s",
                       (uid,)).fetchone()
         if p:
             new_level, new_xp, _ = add_xp(p["level"], p["xp"], xp)
-            c.execute("UPDATE players SET coins=?, level=?, xp=? WHERE user_id=?",
+            c.execute("UPDATE players SET coins=%s, level=%s, xp=%s WHERE user_id=%s",
                       (p["coins"] + coins, new_level, new_xp, uid))
     return True
 
@@ -380,7 +437,7 @@ def top_players(limit=10):
             best_score
         FROM players
         ORDER BY level DESC, best_score DESC, wins DESC
-        LIMIT ?
+        LIMIT %s
         """, (limit,)).fetchall()
 
     return [(r["shown_name"], r["best_score"]) for r in rows]
@@ -395,21 +452,21 @@ def add_category(name):
 
     try:
         with conn() as c:
-            c.execute("INSERT INTO categories(name) VALUES (?)", (name,))
+            c.execute("INSERT INTO categories(name) VALUES (%s)", (name,))
         return True
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return False
 
 
 def del_category(name):
     with conn() as c:
-        cur = c.execute("DELETE FROM categories WHERE name=?", ((name or "").strip(),))
+        cur = c.execute("DELETE FROM categories WHERE name=%s", ((name or "").strip(),))
         return cur.rowcount > 0
 
 
 def get_category(name):
     with conn() as c:
-        r = c.execute("SELECT * FROM categories WHERE name=?", ((name or "").strip(),)).fetchone()
+        r = c.execute("SELECT * FROM categories WHERE name=%s", ((name or "").strip(),)).fetchone()
     return dict(r) if r else None
 
 
@@ -436,7 +493,7 @@ def find_word(category, word):
         r = c.execute("""
             SELECT *
             FROM words
-            WHERE category_id=? AND normalized_word=?
+            WHERE category_id=%s AND normalized_word=%s
             LIMIT 1
         """, (cat["id"], nw)).fetchone()
 
@@ -473,7 +530,7 @@ def add_word(category, word, difficulty=1, rarity=1, points=10, synonyms="", clu
                     category_id, word, normalized_word,
                     difficulty, rarity, points, synonyms, clue
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 cat["id"],
                 word,
@@ -485,7 +542,7 @@ def add_word(category, word, difficulty=1, rarity=1, points=10, synonyms="", clu
                 clue or "",
             ))
         return True
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return False
 
 
@@ -496,8 +553,8 @@ def del_word(category, word):
 
     with conn() as c:
         cur = c.execute(
-            "DELETE FROM words WHERE category_id=? AND word=?",
-            (cat["id"], (word or "").strip())
+            "DELETE FROM words WHERE category_id=%s AND word=%s",
+            (cat["id"], (word or "").strip()),
         )
         return cur.rowcount > 0
 
@@ -509,8 +566,8 @@ def list_words(category):
 
     with conn() as c:
         rows = c.execute(
-            "SELECT word FROM words WHERE category_id=? ORDER BY word",
-            (cat["id"],)
+            "SELECT word FROM words WHERE category_id=%s ORDER BY word",
+            (cat["id"],),
         ).fetchall()
 
     return [r["word"] for r in rows]
@@ -525,7 +582,7 @@ def lex_rows(category):
         rows = c.execute("""
         SELECT word, difficulty, rarity, points, synonyms, clue, usage_count
         FROM words
-        WHERE category_id=?
+        WHERE category_id=%s
         ORDER BY word
         """, (cat["id"],)).fetchall()
 
@@ -554,9 +611,9 @@ def bump_word_use(category, word, user_id=None):
         cur = c.execute("""
         UPDATE words
         SET usage_count = COALESCE(usage_count, 0) + 1,
-            last_used_by = ?,
-            last_used_at = ?
-        WHERE category_id=? AND word=?
+            last_used_by = %s,
+            last_used_at = %s
+        WHERE category_id=%s AND word=%s
         """, (user_id, int(time.time()), cat["id"], (word or "").strip()))
         return cur.rowcount > 0
 
@@ -566,6 +623,7 @@ def random_category():
 
     cats = [n for n, cnt in list_categories() if cnt > 0]
     return random.choice(cats) if cats else None
+
 
 def import_words(records):
     added = 0
@@ -580,19 +638,19 @@ def import_words(records):
             if not word or not category:
                 skipped += 1
                 continue
-            cat = c.execute("SELECT id FROM categories WHERE name=?", (category,)).fetchone()
+            cat = c.execute("SELECT id FROM categories WHERE name=%s", (category,)).fetchone()
             if not cat:
                 try:
-                    c.execute("INSERT INTO categories(name) VALUES (?)", (category,))
-                    cat_id = c.execute("SELECT id FROM categories WHERE name=?", (category,)).fetchone()["id"]
-                except sqlite3.IntegrityError:
+                    c.execute("INSERT INTO categories(name) VALUES (%s)", (category,))
+                    cat_id = c.execute("SELECT id FROM categories WHERE name=%s", (category,)).fetchone()["id"]
+                except IntegrityError:
                     skipped += 1
                     continue
             else:
                 cat_id = cat["id"]
             nw = normalize_word(word)
             exists = c.execute(
-                "SELECT 1 FROM words WHERE category_id=? AND normalized_word=? LIMIT 1",
+                "SELECT 1 FROM words WHERE category_id=%s AND normalized_word=%s LIMIT 1",
                 (cat_id, nw)).fetchone()
             if exists:
                 skipped += 1
@@ -600,7 +658,7 @@ def import_words(records):
             try:
                 c.execute("""INSERT INTO words(category_id, word, normalized_word,
                              difficulty, rarity, points, synonyms, clue)
-                             VALUES (?,?,?,?,?,?,?,?)""",
+                             VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
                           (cat_id, word, nw,
                            int(r.get("difficulty", 1) or 1),
                            int(r.get("rarity", 1) or 1),
@@ -608,7 +666,7 @@ def import_words(records):
                            r.get("synonyms", "") or "",
                            r.get("clue", "") or ""))
                 added += 1
-            except sqlite3.IntegrityError:
+            except IntegrityError:
                 skipped += 1
     return added, skipped
 
@@ -649,7 +707,7 @@ def add_suggestion(user_id, user_name, word, category, description="", source="m
 
         if cat_id:
             dup = c.execute(
-                "SELECT 1 FROM words WHERE category_id=? AND normalized_word=? LIMIT 1",
+                "SELECT 1 FROM words WHERE category_id=%s AND normalized_word=%s LIMIT 1",
                 (cat_id, normalize_word(word))
             ).fetchone()
 
@@ -658,7 +716,7 @@ def add_suggestion(user_id, user_name, word, category, description="", source="m
 
         pending = c.execute(
             """SELECT 1 FROM word_suggestions
-               WHERE category=? AND normalized_word=? 
+               WHERE category=%s AND normalized_word=%s
                AND status='pending' LIMIT 1""",
             (category, normalize_word(word))
         ).fetchone()
@@ -671,7 +729,7 @@ def add_suggestion(user_id, user_name, word, category, description="", source="m
                 user_id, user_name, word, normalized_word,
                 category, description, source, status, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s)
         """, (
             user_id,
             user_name or "",
@@ -693,7 +751,7 @@ def pending_suggestions(limit=10):
             FROM word_suggestions
             WHERE status='pending'
             ORDER BY created_at ASC
-            LIMIT ?
+            LIMIT %s
         """, (limit,)).fetchall()
 
     return [dict(r) for r in rows]
@@ -702,11 +760,12 @@ def pending_suggestions(limit=10):
 def get_suggestion(sid):
     with conn() as c:
         r = c.execute(
-            "SELECT * FROM word_suggestions WHERE id=?",
+            "SELECT * FROM word_suggestions WHERE id=%s",
             (sid,)
         ).fetchone()
 
     return dict(r) if r else None
+
 
 def approve_suggestion(sid, admin_id, new_word=None, new_category=None):
     s = get_suggestion(sid)
@@ -719,35 +778,36 @@ def approve_suggestion(sid, admin_id, new_word=None, new_category=None):
     now = int(time.time())
 
     with conn() as c:
-        cat = c.execute("SELECT id FROM categories WHERE name=?", (category,)).fetchone()
+        cat = c.execute("SELECT id FROM categories WHERE name=%s", (category,)).fetchone()
         if not cat:
-            c.execute("INSERT INTO categories(name) VALUES (?)", (category,))
-            cat_id = c.execute("SELECT id FROM categories WHERE name=?", (category,)).fetchone()["id"]
+            c.execute("INSERT INTO categories(name) VALUES (%s)", (category,))
+            cat_id = c.execute("SELECT id FROM categories WHERE name=%s", (category,)).fetchone()["id"]
         else:
             cat_id = cat["id"]
 
-        dup = c.execute("SELECT 1 FROM words WHERE category_id=? AND normalized_word=? LIMIT 1",
+        dup = c.execute("SELECT 1 FROM words WHERE category_id=%s AND normalized_word=%s LIMIT 1",
                         (cat_id, nw)).fetchone()
         ok = False
         if not dup:
             try:
                 c.execute("""INSERT INTO words(category_id, word, normalized_word)
-                             VALUES (?,?,?)""", (cat_id, word, nw))
+                             VALUES (%s,%s,%s)""", (cat_id, word, nw))
                 ok = True
-            except sqlite3.IntegrityError:
+            except IntegrityError:
                 ok = False
 
         c.execute("""UPDATE word_suggestions
-                     SET status='approved', word=?, normalized_word=?, category=?,
-                         admin_id=?, reviewed_at=? WHERE id=?""",
+                     SET status='approved', word=%s, normalized_word=%s, category=%s,
+                         admin_id=%s, reviewed_at=%s WHERE id=%s""",
                   (word, nw, category, admin_id, now, sid))
-        c.execute("UPDATE players SET accepted_words=COALESCE(accepted_words,0)+1 WHERE user_id=?",
+        c.execute("UPDATE players SET accepted_words=COALESCE(accepted_words,0)+1 WHERE user_id=%s",
                   (s["user_id"],))
         c.execute("""INSERT INTO change_logs(admin_id, action, target_type, target_id, detail, created_at)
-                     VALUES (?, 'approve_suggestion', 'word_suggestion', ?, ?, ?)""",
+                     VALUES (%s, 'approve_suggestion', 'word_suggestion', %s, %s, %s)""",
                   (admin_id, str(sid), f"{word} -> {category}, inserted={ok}", now))
 
     return True, "پیشنهاد تأیید شد و کلمه به دیتابیس اضافه شد."
+
 
 def reject_suggestion(sid, admin_id, note=""):
     s = get_suggestion(sid)
@@ -758,10 +818,10 @@ def reject_suggestion(sid, admin_id, note=""):
         c.execute("""
             UPDATE word_suggestions
             SET status='rejected',
-                admin_id=?,
-                admin_note=?,
-                reviewed_at=?
-            WHERE id=?
+                admin_id=%s,
+                admin_note=%s,
+                reviewed_at=%s
+            WHERE id=%s
         """, (
             admin_id,
             note or "",
@@ -771,7 +831,7 @@ def reject_suggestion(sid, admin_id, note=""):
 
         c.execute("""
             INSERT INTO change_logs(admin_id, action, target_type, target_id, detail, created_at)
-            VALUES (?, 'reject_suggestion', 'word_suggestion', ?, ?, ?)
+            VALUES (%s, 'reject_suggestion', 'word_suggestion', %s, %s, %s)
         """, (
             admin_id,
             str(sid),
@@ -794,12 +854,12 @@ def edit_suggestion(sid, admin_id, word=None, category=None, description=None):
     with conn() as c:
         c.execute("""
             UPDATE word_suggestions
-            SET word=?,
-                normalized_word=?,
-                category=?,
-                description=?,
-                admin_id=?
-            WHERE id=?
+            SET word=%s,
+                normalized_word=%s,
+                category=%s,
+                description=%s,
+                admin_id=%s
+            WHERE id=%s
         """, (
             new_word,
             normalize_word(new_word),
@@ -811,7 +871,7 @@ def edit_suggestion(sid, admin_id, word=None, category=None, description=None):
 
         c.execute("""
             INSERT INTO change_logs(admin_id, action, target_type, target_id, detail, created_at)
-            VALUES (?, 'edit_suggestion', 'word_suggestion', ?, ?, ?)
+            VALUES (%s, 'edit_suggestion', 'word_suggestion', %s, %s, %s)
         """, (
             admin_id,
             str(sid),
@@ -827,13 +887,13 @@ def suggestion_stats_for_user(uid):
         total = c.execute("""
             SELECT COUNT(*) n
             FROM word_suggestions
-            WHERE user_id=?
+            WHERE user_id=%s
         """, (uid,)).fetchone()["n"]
 
         approved = c.execute("""
             SELECT COUNT(*) n
             FROM word_suggestions
-            WHERE user_id=? AND status='approved'
+            WHERE user_id=%s AND status='approved'
         """, (uid,)).fetchone()["n"]
 
     return {"total": total, "approved": approved}
@@ -845,7 +905,8 @@ def add_match_report(chat_id, mode, winner_id, players_count):
     with conn() as c:
         cur = c.execute("""
             INSERT INTO match_reports(chat_id, mode, winner_id, players, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
         """, (
             chat_id,
             mode,
@@ -853,7 +914,7 @@ def add_match_report(chat_id, mode, winner_id, players_count):
             players_count,
             int(time.time())
         ))
-        return cur.lastrowid
+        return cur.fetchone()["id"]
 
 
 def latest_match_reports(limit=10):
@@ -862,7 +923,7 @@ def latest_match_reports(limit=10):
             SELECT *
             FROM match_reports
             ORDER BY created_at DESC
-            LIMIT ?
+            LIMIT %s
         """, (limit,)).fetchall()
 
     return [dict(r) for r in rows]
@@ -874,7 +935,7 @@ def add_lucky_box(user_id, match_id, item_type, item_value, rarity):
     with conn() as c:
         c.execute("""
             INSERT INTO lucky_boxes(user_id, match_id, item_type, item_value, rarity, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             match_id,
@@ -889,21 +950,22 @@ def add_lucky_box(user_id, match_id, item_type, item_value, rarity):
 
 def is_db_admin(uid):
     with conn() as c:
-        r = c.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)).fetchone()
+        r = c.execute("SELECT 1 FROM admins WHERE user_id=%s", (uid,)).fetchone()
     return r is not None
 
 
 def add_admin(uid, by):
     with conn() as c:
         c.execute("""
-        INSERT OR IGNORE INTO admins(user_id, added_by, added_at)
-        VALUES (?, ?, ?)
+        INSERT INTO admins(user_id, added_by, added_at)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id) DO NOTHING
         """, (uid, by, int(time.time())))
 
 
 def del_admin(uid):
     with conn() as c:
-        cur = c.execute("DELETE FROM admins WHERE user_id=?", (uid,))
+        cur = c.execute("DELETE FROM admins WHERE user_id=%s", (uid,))
         return cur.rowcount > 0
 
 
@@ -937,27 +999,28 @@ def seed_namefamily_words(clean_extra_categories=True):
             rows = c.execute("SELECT name FROM categories").fetchall()
             for r in rows:
                 if r["name"] not in allowed:
-                    c.execute("DELETE FROM categories WHERE name=?", (r["name"],))
+                    c.execute("DELETE FROM categories WHERE name=%s", (r["name"],))
         for cat in NAMEFAMILY_ALLOWED_CATEGORIES:
-            c.execute("INSERT OR IGNORE INTO categories(name) VALUES (?)", (cat,))
-            cat_id = c.execute("SELECT id FROM categories WHERE name=?", (cat,)).fetchone()["id"]
+            c.execute("INSERT INTO categories(name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (cat,))
+            cat_id = c.execute("SELECT id FROM categories WHERE name=%s", (cat,)).fetchone()["id"]
             for word in NAMEFAMILY_WORD_BANK.get(cat, []):
                 w = (word or "").strip()
                 if not w:
                     continue
                 nw = normalize_word(w)
-                exists = c.execute("SELECT 1 FROM words WHERE category_id=? AND normalized_word=? LIMIT 1", (cat_id, nw)).fetchone()
+                exists = c.execute("SELECT 1 FROM words WHERE category_id=%s AND normalized_word=%s LIMIT 1", (cat_id, nw)).fetchone()
                 if exists:
                     continue
                 c.execute("""
-                    INSERT OR IGNORE INTO words(category_id, word, normalized_word, difficulty, rarity, points)
-                    VALUES (?, ?, ?, 1, 1, 10)
+                    INSERT INTO words(category_id, word, normalized_word, difficulty, rarity, points)
+                    VALUES (%s, %s, %s, 1, 1, 10)
+                    ON CONFLICT (category_id, word) DO NOTHING
                 """, (cat_id, w, nw))
     return True
 
 
 # ---------- garden (delegation) ----------
-from core.garden_db import GardenAPI as _GardenAPI
+from core.garden_db import GardenAPI as _GardenAPI  # noqa: E402
 _garden = _GardenAPI(conn)
 
 def garden_ensure_starter(uid, name=""):        return _garden.ensure_starter(uid, name)

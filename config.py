@@ -4,9 +4,18 @@
 """
 import os
 from dotenv import load_dotenv
-# توکن ربات (از @BotFather) — حتماً به‌صورت متغیر محیطی ست شود.
+
 load_dotenv()
+
+# توکن ربات (از @BotFather) — حتماً به‌صورت متغیر محیطی ست شود.
 BOT_TOKEN = os.getenv("KALEMO_BOT_TOKEN")
+
+# آدرس اتصال به PostgreSQL. روی Render مقدار «Internal Database URL» را اینجا بگذارید.
+# مثال: postg://user:pass@host:5432/dbname
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+# حداکثر اندازه‌ی connection pool. روی پلن رایگان Render کوچک نگه دارید.
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "5"))
 
 # یوزرنیم ربات (بدون @) — برای لینک افزودن به گروه
 BOT_USERNAME = os.getenv("KALEMO_BOT_USERNAME")
@@ -17,7 +26,7 @@ ADMIN_IDS = {
     if x.strip().lstrip("-").isdigit()
 }
 
-# مسیر دیتابیس
+# مسیر دیتابیس SQLite دیگر استفاده نمی‌شود؛ فقط برای سازگاری عقب‌رو نگه داشته شده.
 DB_PATH = os.environ.get("KALEMO_DB", "kalemo.db")
 
 # فاصله زمانی مجاز برای تغییر نام نمایشی (ثانیه) — پیش‌فرض ۷ روز
