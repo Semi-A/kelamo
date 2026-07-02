@@ -6,7 +6,7 @@ import asyncio
 from telegram import Update
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
-
+from telegram.error import BadRequest
 import config
 from core import db
 from features import admin_service as adm, player_service as svc
@@ -113,6 +113,65 @@ async def on_admin_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             parse_mode=HTML,
             reply_markup=kb.admin_suggestion_kb(sug["id"])
         )
+
+    if action == "sapp":
+        sid = int(parts[2])
+        ok, msg = db.approve_suggestion(sid, uid)
+
+        rows = db.pending_suggestions(1)
+
+        if rows:
+            sug = rows[0]
+            text = (
+                "💡 <b>پیشنهاد کلمه</b>\n"
+                "━━━━━━━━━━━━━━\n"
+                f"کلمه: <b>{sug['word']}</b>\n"
+                f"دسته: <b>{sug['category']}</b>\n"
+                f"توضیح: {sug.get('description') or '—'}"
+            )
+
+            return await q.message.edit_text(
+                "✅ " + msg + "\n\n" + text,
+                parse_mode=HTML,
+                reply_markup=kb.admin_suggestion_kb(sug["id"])
+            )
+
+        return await q.message.edit_text(
+            "✅ " + msg + "\n\nدیگه پیشنهادی باقی نمونده.",
+            parse_mode=HTML,
+            reply_markup=kb.admin_back()
+        )
+
+
+    if action == "srej":
+        sid = int(parts[2])
+
+        db.reject_suggestion(sid, uid)
+
+        rows = db.pending_suggestions(1)
+
+        if rows:
+            sug = rows[0]
+            text = (
+                "💡 <b>پیشنهاد کلمه</b>\n"
+                "━━━━━━━━━━━━━━\n"
+                f"کلمه: <b>{sug['word']}</b>\n"
+                f"دسته: <b>{sug['category']}</b>\n"
+                f"توضیح: {sug.get('description') or '—'}"
+            )
+
+            return await q.message.edit_text(
+                "❌ پیشنهاد رد شد.\n\n" + text,
+                parse_mode=HTML,
+                reply_markup=kb.admin_suggestion_kb(sug["id"])
+            )
+
+        return await q.message.edit_text(
+            "❌ پیشنهاد رد شد.\n\nدیگه پیشنهادی باقی نمونده.",
+            parse_mode=HTML,
+            reply_markup=kb.admin_back()
+        )
+
 
     if action == "admins":
         if not adm.is_owner(uid):

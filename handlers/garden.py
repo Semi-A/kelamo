@@ -164,12 +164,21 @@ def garden_card(uid, viewer_uid=None):
 
 def home_kb(uid):
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🌱 کاشت بذر", callback_data="g:plant"), InlineKeyboardButton("🎁 برداشت", callback_data="g:harvest")],
-        [InlineKeyboardButton("🎒 موجودی بذرها", callback_data="g:inv"), InlineKeyboardButton("👥 باغ دوستان", callback_data="g:friends")],
-        InlineKeyboardButton("📖 راهنمای باغچه", callback_data="g:help"),
-        [InlineKeyboardButton("🔄 تازه‌سازی", callback_data="g:home")],
+        [
+            InlineKeyboardButton("🌱 کاشت بذر", callback_data="g:plant"),
+            InlineKeyboardButton("🎁 برداشت", callback_data="g:harvest")
+        ],
+        [
+            InlineKeyboardButton("🎒 موجودی بذرها", callback_data="g:inv"),
+            InlineKeyboardButton("👥 باغ دوستان", callback_data="g:friends")
+        ],
+        [
+            InlineKeyboardButton("📖 راهنمای باغچه", callback_data="g:help")
+        ],
+        [
+            InlineKeyboardButton("🔄 تازه‌سازی", callback_data="g:home")
+        ],
     ])
-
 
 def plant_kb(uid):
     seeds = db.garden_seed_inventory(uid)
