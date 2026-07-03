@@ -459,17 +459,21 @@ def top_players(limit=10):
 # ---------- categories & words ----------
 
 def add_category(name):
+    print("ADDING CATEGORY:", name)
     name = (name or "").strip()
     if not name:
         return False
 
     try:
         with conn() as c:
-            c.execute("INSERT INTO categories(name) VALUES (%s)", (name,))
+            c.execute(
+                "INSERT INTO categories(name) VALUES (%s) ON CONFLICT DO NOTHING",
+                (name,)
+            )
         return True
-    except IntegrityError:
+    except Exception as e:
+        print("add_category error:", e)
         return False
-
 
 def del_category(name):
     with conn() as c:
@@ -479,9 +483,11 @@ def del_category(name):
 
 def get_category(name):
     with conn() as c:
-        r = c.execute("SELECT * FROM categories WHERE name=%s", ((name or "").strip(),)).fetchone()
-    return dict(r) if r else None
-
+        c.execute(
+            "SELECT id, name FROM categories WHERE name=%s",
+            (name,)
+        )
+        return c.fetchone()
 
 def list_categories():
     with conn() as c:
@@ -525,11 +531,15 @@ def add_word(category, word, difficulty=1, rarity=1, points=10, synonyms="", clu
         return False
 
     cat = get_category(category)
+
     if not cat:
-        if not add_category(category):
-            return False
+        add_category(category)
         cat = get_category(category)
 
+    if not cat:
+        print("CATEGORY CREATION FAILED:", category)
+        return False
+    
     if find_word(category, word):
         return False
 
