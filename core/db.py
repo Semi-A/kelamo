@@ -483,12 +483,13 @@ def del_category(name):
 
 def get_category(name):
     with conn() as c:
-        c.execute(
+        cur = c.cursor()
+        cur.execute(
             "SELECT id, name FROM categories WHERE name=%s",
             (name,)
         )
-        return c.fetchone()
-
+        return cur.fetchone()
+    
 def list_categories():
     with conn() as c:
         rows = c.execute("""
