@@ -1101,11 +1101,6 @@ NAMEFAMILY_WORD_BANK = {
 def seed_namefamily_words(clean_extra_categories=True):
     allowed = set(NAMEFAMILY_ALLOWED_CATEGORIES)
     with conn() as c:
-        if clean_extra_categories:
-            rows = c.execute("SELECT name FROM categories").fetchall()
-            for r in rows:
-                if r["name"] not in allowed:
-                    c.execute("DELETE FROM categories WHERE name=%s", (r["name"],))
         for cat in NAMEFAMILY_ALLOWED_CATEGORIES:
             c.execute("INSERT INTO categories(name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (cat,))
             cat_id = c.execute("SELECT id FROM categories WHERE name=%s", (cat,)).fetchone()["id"]
