@@ -8,6 +8,8 @@ import random
 # الفبای فارسی برای انتخاب تصادفی حرف
 PERSIAN_LETTERS = list("ابپتثجچحخدذرزژسشصضطظعغفقکگلمنوهی")
 
+
+
 class Rule:
     id = "base"
     label = "قانون پایه"
@@ -29,6 +31,10 @@ class Rule:
         """آیا کلمه این قانون را رعایت می‌کند؟ (True/False)"""
         return True
 
+
+class NoDisturb(Rule):
+    id = "no_disturb"; label = "بدون مزاحمت"
+    def describe(self): return "حذف پیام‌های نامرتبط بازیکنان"
 
 class MinLen(Rule):
     id = "min_len"; label = "حداقل تعداد حروف"; needs_param = True
@@ -84,9 +90,8 @@ class BonusScore(Rule):
 # ثبت همه قوانین — افزودن قانون جدید فقط همین‌جا یک خط
 REGISTRY = {r.id: r for r in [
     MinLen, MaxLen, ExactLen, StartsWith, EndsWith,
-    MustContain, MustNotContain, TimeLimit, BonusScore,
+    MustContain, MustNotContain, TimeLimit, BonusScore, NoDisturb,
 ]}
-
 # قوانینی که برای مود «قوانین متغیر» تصادفی انتخاب می‌شوند (پارامتری‌ها)
 RANDOMIZABLE = ["min_len", "max_len", "exact_len", "starts_with",
                 "ends_with", "must_contain", "must_not_contain"]
@@ -135,3 +140,4 @@ class RuleSet:
             if not r.check(word):
                 return False, r.describe()
         return True, None
+    

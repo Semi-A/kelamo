@@ -414,9 +414,8 @@ async def _run_loop(ctx, s):
 
             rem = s.remaining()
             if rem is not None and rem <= 0:
-                await _finish(ctx, s.chat_id, reason="time")
+                asyncio.create_task(_finish(ctx, s.chat_id, reason="time"))
                 return
-
             # auto-skip برای مودهای سوال‌محورِ واجد شرایط
             if s.autoskip_enabled() and not s.is_round_based():
                 last = s.last_answer_at or s.started_at or time.time()
@@ -428,9 +427,9 @@ async def _run_loop(ctx, s):
                 await _update_live(ctx, s)
     except asyncio.CancelledError:
         return
-    except Exception:
-        log.exception("خطای غیرمنتظره در حلقه‌ی بازی (chat_id=%s)", s.chat_id)
-
+    except Exception as e:
+        print("RUN_LOOP ERROR:", e)
+        raise
 
 async def _autoskip(ctx, s):
     """سوال فعلی را رد می‌کند و سوال بعدی را نمایش می‌دهد."""
@@ -622,7 +621,8 @@ async def on_group_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _maybe_focus(ctx, s, msg, text, u, is_answer):
-    if not s.focus_mode:
+    active = s.focus_mode or s.ruleset.is_active("no_disturb")
+    if not active:
         return False
     too_long = len(text.split()) > FOCUS_WORD_LIMIT
     if is_answer or not too_long:
@@ -633,7 +633,6 @@ async def _maybe_focus(ctx, s, msg, text, u, is_answer):
     await _warn_and_maybe_mute(
         ctx, s, s.chat_id, u, "حین بازی فقط جواب بده، نه جمله")
     return True
-
 
 async def handle_start_during_game(update, ctx):
     chat = update.effective_chat

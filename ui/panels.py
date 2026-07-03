@@ -28,15 +28,19 @@ def lobby_text(s):
 
 
 def lobby_kb(s):
-    return M([
+    rows = [
         [B("🎲 انتخاب مود", callback_data="k:mode"),
          B("⏱ زمان", callback_data="k:time")],
+    ]
+    if s.mode_id == "classic_choice":
+        rows.append([B("📂 انتخاب دسته", callback_data="k:cat")])
+    rows += [
         [B("⚙ قوانین", callback_data="k:rules")],
         [B(f"👥 عضویت ({s.count()})", callback_data="k:join")],
         [B("▶ شروع بازی", callback_data="k:start"),
          B("❌ لغو", callback_data="k:cancel")],
-    ])
-
+    ]
+    return M(rows)
 
 # ---- انتخاب مود ----
 def mode_text():
@@ -81,8 +85,7 @@ def difficulty_kb(s):
 
 # ---- قوانین ----
 TOGGLEABLE = ["min_len", "max_len", "exact_len", "starts_with", "ends_with",
-              "must_contain", "must_not_contain", "time_limit", "bonus"]
-
+              "must_contain", "must_not_contain", "time_limit", "bonus", "no_disturb"]
 
 def rules_text():
     return ("⚙ <b>قوانین بازی</b>\n" + DIV +
