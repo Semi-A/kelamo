@@ -6,7 +6,7 @@ from game.rules import REGISTRY
 from game.session import TIME_OPTIONS, DIFFICULTY_OPTIONS, time_label, difficulty_label
 from telegram import InlineKeyboardButton as B
 from telegram import InlineKeyboardMarkup as M
-
+from core import db
 DIV = "────────────────"
 
 
