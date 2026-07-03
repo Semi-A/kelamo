@@ -2113,6 +2113,12 @@ from .variable import VariableMode
 from .namefamily import NameFamilyMode
 from .clue import ClueMode
 
+from .classic import ClassicRandomMode, ClassicChoiceMode
+from .chain import ChainMode
+from .variable import VariableMode
+from .namefamily import NameFamilyMode
+from .clue import ClueMode
+
 MODE_ORDER = ["classic_random", "classic_choice", "chain", "namefamily", "variable", "clue"]
 
 REGISTRY = {
@@ -2123,6 +2129,20 @@ REGISTRY = {
     NameFamilyMode.id: NameFamilyMode,
     ClueMode.id: ClueMode,
 }
+
+# فقط این دسته‌ها وارد مود زنجیره می‌شن
+CHAIN_CATEGORIES = ["میوه‌ها", "حیوانات", "کشورها"]
+
+
+def _merge_categories(all_categories: dict, names: list) -> list:
+    merged, seen = [], set()
+    for name in names:
+        for w in all_categories.get(name, []):
+            n = (w or "").strip()
+            if n and n not in seen:
+                seen.add(n)
+                merged.append(w)
+    return merged
 
 _META = {
     "classic_random": {
@@ -3094,6 +3114,20 @@ from game.modes import get_mode_class, mode_meta
 from core.normalize import normalize_word
 from game import ranking
 
+CHAIN_CATEGORIES = ["میوه", "رنگ", "کشور","شهر","حیوان","غذا","اشیا"]  # دسته‌های مجاز خودت رو بذار
+
+
+def _merge_categories(all_categories: dict, names: list) -> list:
+    merged, seen = [], set()
+    for name in names:
+        for w in all_categories.get(name, []):
+            n = (w or "").strip()
+            if n and n not in seen:
+                seen.add(n)
+                merged.append(w)
+    return merged
+
+
 # گزینه‌های زمان مسابقه (ثانیه) — 0 یعنی نامحدود
 TIME_OPTIONS = [
     (120,  "۲ دقیقه"),
@@ -3229,6 +3263,12 @@ class Session:
 
         if self.mode_id in ("classic_random", "classic_choice", "chain"):
             kwargs["category"] = self.category
+
+        if self.mode_id == "chain":
+            # به‌جای دسته‌ی انتخابی کاربر، فقط دسته‌های مجاز رو قاطی کن
+            kwargs["words"] = _merge_categories(self.all_categories, CHAIN_CATEGORIES)
+            kwargs["category"] = " / ".join(CHAIN_CATEGORIES)
+
 
         elif self.mode_id == "namefamily":
             kwargs["categories"] = self.namefamily_categories
@@ -7729,6 +7769,12 @@ from .variable import VariableMode
 from .namefamily import NameFamilyMode
 from .clue import ClueMode
 
+from .classic import ClassicRandomMode, ClassicChoiceMode
+from .chain import ChainMode
+from .variable import VariableMode
+from .namefamily import NameFamilyMode
+from .clue import ClueMode
+
 MODE_ORDER = ["classic_random", "classic_choice", "chain", "namefamily", "variable", "clue"]
 
 REGISTRY = {
@@ -7739,6 +7785,20 @@ REGISTRY = {
     NameFamilyMode.id: NameFamilyMode,
     ClueMode.id: ClueMode,
 }
+
+# فقط این دسته‌ها وارد مود زنجیره می‌شن
+CHAIN_CATEGORIES = ["میوه‌ها", "حیوانات", "کشورها"]
+
+
+def _merge_categories(all_categories: dict, names: list) -> list:
+    merged, seen = [], set()
+    for name in names:
+        for w in all_categories.get(name, []):
+            n = (w or "").strip()
+            if n and n not in seen:
+                seen.add(n)
+                merged.append(w)
+    return merged
 
 _META = {
     "classic_random": {
@@ -8710,6 +8770,20 @@ from game.modes import get_mode_class, mode_meta
 from core.normalize import normalize_word
 from game import ranking
 
+CHAIN_CATEGORIES = ["میوه", "رنگ", "کشور","شهر","حیوان","غذا","اشیا"]  # دسته‌های مجاز خودت رو بذار
+
+
+def _merge_categories(all_categories: dict, names: list) -> list:
+    merged, seen = [], set()
+    for name in names:
+        for w in all_categories.get(name, []):
+            n = (w or "").strip()
+            if n and n not in seen:
+                seen.add(n)
+                merged.append(w)
+    return merged
+
+
 # گزینه‌های زمان مسابقه (ثانیه) — 0 یعنی نامحدود
 TIME_OPTIONS = [
     (120,  "۲ دقیقه"),
@@ -8845,6 +8919,12 @@ class Session:
 
         if self.mode_id in ("classic_random", "classic_choice", "chain"):
             kwargs["category"] = self.category
+
+        if self.mode_id == "chain":
+            # به‌جای دسته‌ی انتخابی کاربر، فقط دسته‌های مجاز رو قاطی کن
+            kwargs["words"] = _merge_categories(self.all_categories, CHAIN_CATEGORIES)
+            kwargs["category"] = " / ".join(CHAIN_CATEGORIES)
+
 
         elif self.mode_id == "namefamily":
             kwargs["categories"] = self.namefamily_categories
@@ -17500,7 +17580,7 @@ from game.rules import REGISTRY
 from game.session import TIME_OPTIONS, DIFFICULTY_OPTIONS, time_label, difficulty_label
 from telegram import InlineKeyboardButton as B
 from telegram import InlineKeyboardMarkup as M
-
+from core import db
 DIV = "────────────────"
 
 
@@ -17775,33 +17855,17 @@ def namefamily_category_text():
     )
 
 def namefamily_category_kb(s):
-
     cats = db.list_categories()
-
     rows = []
-
     for cat, cnt in cats:
-
         mark = "✅" if cat in s.namefamily_categories else "⬜"
-
         rows.append([
-            B(
-                f"{mark} {cat}",
-                callback_data=f"lobby:nftoggle:{cat}"
-            )
+            B(f"{mark} {cat}", callback_data=f"k:nftoggle:{cat}")
         ])
 
-    rows.append([
-        B("🎲 انتخاب تصادفی", callback_data="lobby:nfrandom")
-    ])
-
-    rows.append([
-        B("✅ تایید", callback_data="lobby:nfdone")
-    ])
-
-    rows.append([
-        B("◀ بازگشت", callback_data="lobby:back")
-    ])
+    rows.append([B("🎲 انتخاب تصادفی", callback_data="k:nfrandom")])
+    rows.append([B("✅ تایید", callback_data="k:nfdone")])
+    rows.append([B("◀ بازگشت", callback_data="k:back")])
 
     return M(rows)
 ```

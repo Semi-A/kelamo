@@ -163,10 +163,11 @@ class Session:
             kwargs["category"] = self.category
 
         if self.mode_id == "chain":
-            # به‌جای دسته‌ی انتخابی کاربر، فقط دسته‌های مجاز رو قاطی کن
-            kwargs["words"] = _merge_categories(self.all_categories, CHAIN_CATEGORIES)
+            from core import db
+            all_cats = {name: db.list_words(name) or [] for name, _ in db.list_categories()}
+            kwargs["words"] = _merge_categories(all_cats, CHAIN_CATEGORIES)
             kwargs["category"] = " / ".join(CHAIN_CATEGORIES)
-
+            kwargs.pop("category", None)  # چون ChainMode جدید category نمی‌گیرد اگر امضا را عوض کردید
 
         elif self.mode_id == "namefamily":
             kwargs["categories"] = self.namefamily_categories
