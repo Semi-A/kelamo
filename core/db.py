@@ -429,18 +429,31 @@ def claim_mission_atomic(uid, day, coins, xp):
 # ---------- leaderboard ----------
 
 def top_players(limit=10):
+    """لیدربورد کلی بر اساس best_score.
+
+    مرتب‌سازی قطعی (deterministic) طبق game.ranking:
+      1) best_score نزولی  2) wins نزولی  3) user_id صعودی (ثبت‌نام زودتر)
+    این تضمین می‌کند بازیکن با امتیاز کمتر هرگز بالاتر از بازیکن با امتیاز بیشتر
+    نمایش داده نشود، و در تساوی همیشه ترتیب یکسان و قطعی باشد.
+    خروجی نهایی قبل از برگشت با ranking.assert_sorted اعتبارسنجی می‌شود.
+    """
+    from game import ranking
     with conn() as c:
         rows = c.execute("""
         SELECT
             COALESCE(NULLIF(display_name, ''), name, 'کاربر') AS shown_name,
-            level,
-            best_score
+            best_score,
+            wins,
+            user_id
         FROM players
-        ORDER BY level DESC, best_score DESC, wins DESC
+        ORDER BY best_score DESC, wins DESC, user_id ASC
         LIMIT %s
         """, (limit,)).fetchall()
 
-    return [(r["shown_name"], r["best_score"]) for r in rows]
+    result = [(r["shown_name"], r["best_score"]) for r in rows]
+    # گارد نهایی: اگر به هر دلیلی ترتیب خراب بود، همین‌جا شکست می‌خورد.
+    ranking.assert_sorted(result, score_getter=lambda t: t[1])
+    return result
 
 
 # ---------- categories & words ----------

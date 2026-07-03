@@ -4,11 +4,27 @@
 همه با EditMessage.
 
 اسم‌وفامیل: پاسخ‌ها فقط در PV ثبت می‌شوند (handlers/namefamily_private.py).
-پایان مسابقه: گزارش مسابقه ثبت می‌شود و احتمال Lucky Box برای بازیکنان بررسی می‌شود.
+پایان مسابقه: گزارش مسابقه ثبت می‌شود و احتمال «🎁 جعبه شانس» بررسی می‌شود.
+
+نسخه‌ی Phase 1 (Beta) — رفع باگ‌ها:
+- تایمر روی صفر فریز نمی‌شود (remaining هرگز منفی نیست) و در پایان زمان،
+  بازی به‌طور قطعی تمام می‌شود.
+- auto-skip: در مودهای سوال‌محور (به‌جز کلاسیک و اسم‌وفامیل) اگر ۲۰ ثانیه
+  هیچ پاسخ درستی نیاید، سوال به‌طور خودکار رد و سوال بعدی نمایش داده می‌شود.
+- پیام وضعیت دوره‌ای هر ۳۰ ثانیه (status_task) برای زنده نگه‌داشتن مسابقه.
+- خطاهای تسک‌های پس‌زمینه دیگر خاموش نیستند و لاگ می‌شوند.
+- قفل پایان (s.finishing) از اجرای دوباره‌ی پایان (race condition) جلوگیری می‌کند.
+- سازگاری با session.submit جدید (کلیدهای points/found/total) و پاسخ تکراری.
+- «Lucky Box» → «🎁 جعبه شانس».
 """
 import asyncio
+import html
+import logging
 import re
-from telegram import Update
+import time
+from datetime import timedelta
+
+from telegram import Update, ChatPermissions
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
@@ -16,24 +32,23 @@ from core import db
 from features import player_service as svc
 from game import session as sess
 from ui import panels, persona
-import html
-import time
 
 HTML = ParseMode.HTML
-
-import time
-from datetime import timedelta
-from telegram import ChatPermissions
+log = logging.getLogger(__name__)
 
 MAX_WARNS = 3                 # سقف اخطار قبل از سکوت
 MUTE_SECONDS = 5 * 60         # مدت سکوت: ۵ دقیقه
 FOCUS_WORD_LIMIT = 3          # بیش از این تعداد کلمه = پیام جمله‌ای
+STATUS_INTERVAL = 30          # فاصله‌ی پیام وضعیت دوره‌ای (ثانیه)
+LIVE_REFRESH = 10            # فاصله‌ی رفرش پیام زنده (ثانیه)
+
 
 def _arg(parts, i):
     try:
         return parts[i]
     except IndexError:
         return None
+
 
 # عبارت‌های متنی که بازی را شروع می‌کنند (بدون اسلش)
 START_PATTERNS = [r"^شروع\s+کلمو$", r"^شروع\s+بازی$", r"^کلمو$"]
@@ -101,6 +116,7 @@ async def cmd_endgame(update, ctx):
             "⛔️ فقط سازنده‌ی بازی یا ادمین‌های گروه می‌تونن بازی رو تموم کنن.")
     await _finish(ctx, chat.id)
 
+
 async def cmd_settings(update, ctx):
     chat = update.effective_chat
     if chat.type == "private":
@@ -137,10 +153,7 @@ async def _safe_delete(msg):
 
 
 async def _warn_and_maybe_mute(ctx, s, chat_id, u, reason_text):
-    """
-    یک اخطار ثبت می‌کند؛ در اخطار سوم کاربر را ۵ دقیقه سکوت می‌کند.
-    یک پیام کوتاه (خوداتخریب) در گروه می‌فرستد.
-    """
+    """یک اخطار ثبت می‌کند؛ در اخطار سوم کاربر را ۵ دقیقه سکوت می‌کند."""
     n = s.add_warn(u.id)
     name = u.first_name or "کاربر"
 
@@ -155,7 +168,6 @@ async def _warn_and_maybe_mute(ctx, s, chat_id, u, reason_text):
             muted = True
         except Exception:
             muted = False
-        # اخطارها را برای شروع دوباره صفر کن تا بعد از سکوت از نو شمرده شود
         s.warns[u.id] = 0
         if muted:
             txt = (f"🔇 <a href=\"tg://user?id={u.id}\">{name}</a> "
@@ -170,22 +182,23 @@ async def _warn_and_maybe_mute(ctx, s, chat_id, u, reason_text):
 
     try:
         note = await ctx.bot.send_message(chat_id, txt, parse_mode=HTML)
-        # پیام هشدار را بعد از ۵ ثانیه پاک کن تا گروه شلوغ نشود
         ctx.job_queue.run_once(
             lambda c: c.bot.delete_message(chat_id, note.message_id),
             5, name=f"delwarn:{chat_id}:{note.message_id}")
     except Exception:
-        pass
+        log.exception("ارسال/زمان‌بندی حذف پیام اخطار شکست خورد")
+
 
 # ---------- بررسی دسترسی سازنده ----------
 def _host_only(s, uid):
     return uid == s.host_id
 
 
-
 HOST_ACTIONS = {"mode", "setmode", "rules", "toggle", "time", "settime",
                 "diff", "setdiff", "cat", "catpage", "setcat",
                 "start", "cancel", "focus", "end"}
+
+
 # ---------- callbackها ----------
 async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -228,36 +241,28 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await q.answer("مود نامعتبر است.", show_alert=True)
         await q.answer(f"مود شد: {s.mode_name()}")
         return await _refresh_lobby(q, s)
-    
+
     if action == "cat":
         cats = db.list_categories()
         await q.answer()
         return await q.message.edit_text(
-            panels.category_text(),
-            parse_mode=HTML,
-            reply_markup=panels.category_kb(cats, s.category),
-        )
+            panels.category_text(), parse_mode=HTML,
+            reply_markup=panels.category_kb(cats, s.category))
 
     if action == "catpage":
         page = int(_arg(parts, 2) or 0)
         cats = db.list_categories()
         await q.answer()
         return await q.message.edit_text(
-            panels.category_text(),
-            parse_mode=HTML,
-            reply_markup=panels.category_kb(cats, s.category, page=page),
-        )    
+            panels.category_text(), parse_mode=HTML,
+            reply_markup=panels.category_kb(cats, s.category, page=page))
 
     if action == "setcat":
-        page = int(_arg(parts, 2) or 0)
         cat = ":".join(parts[3:]).strip()
-
         if not cat or not db.get_category(cat):
             return await q.answer("دسته نامعتبر است.", show_alert=True)
-
         s.category = cat
         s.words = db.list_words(cat) or []
-
         await q.answer("دسته انتخاب شد.")
         return await _refresh_lobby(q, s)
 
@@ -301,7 +306,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s.ruleset.toggle(rid)
         await q.answer()
         return await q.message.edit_text(panels.rules_text(), parse_mode=HTML,
-                                        reply_markup=panels.rules_kb(s))
+                                         reply_markup=panels.rules_kb(s))
 
     if action == "focus":
         s.focus_mode = not s.focus_mode
@@ -322,10 +327,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if s.count() < 2:
             return await q.answer("حداقل دو بازیکن برای شروع لازم است.", show_alert=True)
         if not _load_category_for_session(s):
-            return await q.answer(
-                "برای این مود دسته/کلمه کافی نیست.",
-                show_alert=True,
-            )
+            return await q.answer("برای این مود دسته/کلمه کافی نیست.", show_alert=True)
         await q.answer()
         return await _start_countdown(q, ctx, s)
 
@@ -335,6 +337,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "فقط سازنده یا ادمین گروه می‌تونه پایان بده.", show_alert=True)
         await q.answer()
         return await _finish(ctx, chat_id)
+
 
 async def _refresh_lobby(q, s):
     try:
@@ -353,10 +356,7 @@ async def _start_countdown(q, ctx, s):
     if mentions:
         try:
             await ctx.bot.send_message(
-                s.chat_id,
-                "شروع مسابقه:\n" + mentions,
-                parse_mode=HTML,
-            )
+                s.chat_id, "شروع مسابقه:\n" + mentions, parse_mode=HTML)
         except Exception:
             pass
     s.live_msg_id = msg.message_id
@@ -392,15 +392,18 @@ async def _start_countdown(q, ctx, s):
         from handlers import namefamily_private as nf
         await nf.start_group_namefamily(ctx, s)
 
-    # زمان‌بند اتمام خودکار + رفرش زنده
+    # زمان‌بند اتمام خودکار/auto-skip + پیام وضعیت دوره‌ای
     s.timer_task = asyncio.create_task(_run_loop(ctx, s))
+    s.status_task = asyncio.create_task(_status_loop(ctx, s))
 
 
 async def _run_loop(ctx, s):
-    """تا پایان زمان، پیام زنده را به‌روزرسانی می‌کند و سپس بازی را تمام می‌کند.
+    """حلقه‌ی اصلی بازی: هر ثانیه بررسی می‌کند.
 
-    برای اسم‌وفامیل هم تایمر قانون بازی ملاک است؛ کامل‌کردن فرم فقط یک شمارش
-    معکوس کوتاه‌تر ایجاد می‌کند، اما پایان بازی وابسته به تکمیل همه پاسخ‌ها نیست.
+    - اگر زمان تمام شد → بازی را تمام می‌کند (تایمر روی صفر فریز نمی‌شود).
+    - auto-skip: اگر مود واجد شرایط باشد و ۲۰ ثانیه هیچ پاسخ درستی نیاید،
+      سوال رد و سوال بعدی نمایش داده می‌شود.
+    - پیام زنده هر LIVE_REFRESH ثانیه به‌روزرسانی می‌شود.
     """
     try:
         while True:
@@ -408,16 +411,69 @@ async def _run_loop(ctx, s):
             cur = sess.get(s.chat_id)
             if not cur or cur is not s or s.state != "running":
                 return
+
             rem = s.remaining()
             if rem is not None and rem <= 0:
                 await _finish(ctx, s.chat_id, reason="time")
                 return
-            if rem is None or int(rem) % 10 == 0:
+
+            # auto-skip برای مودهای سوال‌محورِ واجد شرایط
+            if s.autoskip_enabled() and not s.is_round_based():
+                last = s.last_answer_at or s.started_at or time.time()
+                if time.time() - last >= sess.AUTOSKIP_SECONDS:
+                    await _autoskip(ctx, s)
+
+            # رفرش پیام زنده
+            if rem is None or int(rem) % LIVE_REFRESH == 0:
                 await _update_live(ctx, s)
     except asyncio.CancelledError:
         return
     except Exception:
+        log.exception("خطای غیرمنتظره در حلقه‌ی بازی (chat_id=%s)", s.chat_id)
+
+
+async def _autoskip(ctx, s):
+    """سوال فعلی را رد می‌کند و سوال بعدی را نمایش می‌دهد."""
+    try:
+        prev = s.question.get("prompt") if isinstance(s.question, dict) else None
+        s.next_question()
+        s.last_answer_at = time.time()   # تایمر auto-skip را ریست کن
+        # اگر واقعاً سوال عوض شد، اطلاع بده
+        cur = s.question.get("prompt") if isinstance(s.question, dict) else None
+        if cur != prev:
+            try:
+                await ctx.bot.send_message(
+                    s.chat_id, "⏭ کسی جواب نداد؛ سوال بعدی!", parse_mode=HTML)
+            except Exception:
+                pass
+        await _update_live(ctx, s)
+    except Exception:
+        log.exception("خطا در auto-skip (chat_id=%s)", s.chat_id)
+
+
+async def _status_loop(ctx, s):
+    """هر STATUS_INTERVAL ثانیه یک پیام وضعیت کوتاه در گروه می‌فرستد تا مسابقه
+    زنده و قابل‌دنبال‌کردن بماند (به‌ویژه در گروه‌های شلوغ)."""
+    try:
+        while True:
+            await asyncio.sleep(STATUS_INTERVAL)
+            cur = sess.get(s.chat_id)
+            if not cur or cur is not s or s.state != "running":
+                return
+            leader = s.leader()
+            leader_line = (f"🥇 صدرنشین: <b>{leader[0]}</b> — {leader[1]} امتیاز"
+                           if leader else "🥇 هنوز کسی امتیاز نگرفته")
+            try:
+                await ctx.bot.send_message(
+                    s.chat_id,
+                    f"⏱ باقی‌مانده: <b>{s.remaining_label()}</b>\n{leader_line}",
+                    parse_mode=HTML)
+            except Exception:
+                pass
+    except asyncio.CancelledError:
         return
+    except Exception:
+        log.exception("خطای غیرمنتظره در حلقه‌ی وضعیت (chat_id=%s)", s.chat_id)
 
 
 async def _update_live(ctx, s):
@@ -429,11 +485,18 @@ async def _update_live(ctx, s):
             text=panels.live_text(s), parse_mode=HTML,
             reply_markup=panels.running_kb(s))
     except Exception:
+        # خطای «message is not modified» عادی است؛ لاگ نمی‌کنیم.
         pass
 
 
 # ---------- پایان ----------
 async def _finish(ctx, chat_id, reason=None):
+    # قفل پایان: از اجرای هم‌زمان/دوباره جلوگیری می‌کند (race condition).
+    s = sess.get(chat_id)
+    if not s or getattr(s, "finishing", False):
+        return
+    s.finishing = True
+
     s = sess.remove(chat_id)
     if not s:
         return
@@ -443,21 +506,16 @@ async def _finish(ctx, chat_id, reason=None):
     # ---- مود اسم‌وفامیل ----
     if s.mode_id == "namefamily" and s.mode:
         s.mode.lock()
-
         evaluated = s.mode.evaluate(s.players)
 
-        # پاسخ‌های نامعتبر را وارد صف پیشنهاد کن
         for uid, data in evaluated.items():
             for cell in data["cells"]:
                 if cell["status"] == "❌" and cell["answer"] != "—":
                     db.add_suggestion(
-                        user_id=uid,
-                        user_name=data["name"],
-                        word=cell["answer"],
-                        category=cell["cat"],
+                        user_id=uid, user_name=data["name"],
+                        word=cell["answer"], category=cell["cat"],
                         description="پیشنهاد خودکار از پاسخ نامعتبر اسم‌وفامیل",
-                        source="namefamily"
-                    )
+                        source="namefamily")
 
         for uid, data in evaluated.items():
             if uid in s.players:
@@ -465,69 +523,50 @@ async def _finish(ctx, chat_id, reason=None):
 
         ranking = s.ranking()
         winner = ranking[0][0] if ranking and ranking[0][1]["score"] > 0 else None
-
         for uid, info in ranking:
-            svc.record_game(
-                uid,
-                info["name"],
-                won=(uid == winner),
-                score=info["score"]
-            )
+            svc.record_game(uid, info["name"], won=(uid == winner), score=info["score"])
 
         match_id = db.add_match_report(
-            chat_id=chat_id,
-            mode=s.mode_name(),
-            winner_id=winner,
-            players_count=len(ranking)
-        )
+            chat_id=chat_id, mode=s.mode_name(),
+            winner_id=winner, players_count=len(ranking))
 
-        box_lines = []
-        for uid, info in ranking:
-            item = lucky_box.try_grant(uid, match_id=match_id)
-            if item:
-                box_lines.append(
-                    f"🎁 <b>{info['name']}</b> یک Lucky Box گرفت: {lucky_box.item_text(item)}"
-                )
-
+        box_lines = _grant_boxes(lucky_box, ranking, match_id)
         text = s.mode.result_text(s.players)
         if box_lines:
-            text += "\n\n🎁 <b>Lucky Box</b>\n" + "\n".join(box_lines)
-
-        # طبق درخواست: پیام جدید ارسال می‌شود، پیام اصلی بازی Edit نمی‌شود.
+            text += "\n\n🎁 <b>جعبه شانس</b>\n" + "\n".join(box_lines)
         await ctx.bot.send_message(chat_id, text, parse_mode=HTML)
         return
 
     # ---- بقیه مودها ----
     ranking = s.ranking()
-    medals = ["🥇", "🥈", "🥉"]
-    lines = []
-    for i, (uid, info) in enumerate(ranking):
-        badge = medals[i] if i < 3 else f"{i+1}."
-        lines.append(f"{badge} <b>{info['name']}</b> — {info['score']} امتیاز")
     winner = ranking[0][0] if ranking and ranking[0][1]["score"] > 0 else None
     for uid, info in ranking:
         svc.record_game(uid, info["name"], won=(uid == winner), score=info["score"])
 
     match_id = db.add_match_report(
-        chat_id=chat_id,
-        mode=s.mode_name(),
-        winner_id=winner,
-        players_count=len(ranking)
-    )
+        chat_id=chat_id, mode=s.mode_name(),
+        winner_id=winner, players_count=len(ranking))
 
+    box_lines = _grant_boxes(lucky_box, ranking, match_id)
+    text = panels.finish_text(s, reason=reason)
+    if box_lines:
+        text += "\n\n🎁 <b>جعبه شانس</b>\n" + "\n".join(box_lines)
+    await ctx.bot.send_message(chat_id, text, parse_mode=HTML)
+
+
+def _grant_boxes(lucky_box, ranking, match_id):
+    """برای هر بازیکن شانس «🎁 جعبه شانس» را بررسی می‌کند و خطوط نمایش می‌سازد."""
     box_lines = []
     for uid, info in ranking:
-        item = lucky_box.try_grant(uid, match_id=match_id)
+        try:
+            item = lucky_box.try_grant(uid, match_id=match_id)
+        except Exception:
+            log.exception("خطا در اعطای جعبه شانس به کاربر %s", uid)
+            continue
         if item:
             box_lines.append(
-                f"🎁 <b>{info['name']}</b> یک Lucky Box گرفت: {lucky_box.item_text(item)}"
-            )
-
-    text = panels.finish_text(s, reason=reason) 
-    if box_lines:
-        text += "\n\n🎁 <b>Lucky Box</b>\n" + "\n".join(box_lines)
-
-    await ctx.bot.send_message(chat_id, text, parse_mode=HTML)
+                f"🎁 <b>{info['name']}</b> یک جعبه شانس گرفت: {lucky_box.item_text(item)}")
+    return box_lines
 
 
 # ---------- پیام‌های گروه هنگام بازی ----------
@@ -553,16 +592,14 @@ async def on_group_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # --- مودهای سوال‌محور ---
     res = s.submit(u.id, nm, text)
-    if res and res["ok"]:
-        found, total = s.progress()
 
-        await msg.reply_text(
-            panels.answer_ok_text(
-                res["score"],
-                found,
-                total,
-            )
-        )
+    if res and res.get("ok"):
+        found = res.get("found")
+        total = res.get("total")
+        if found is None or total is None:
+            found, total = s.progress()
+
+        await msg.reply_text(panels.answer_ok_text(res["score"], found, total))
 
         if s.is_completed():
             await _finish(ctx, chat.id, reason="completed")
@@ -570,10 +607,19 @@ async def on_group_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         s.next_question()
         await _update_live(ctx, s)
-
-
         return True
+
+    # پاسخ تکراری: فقط یک تذکر کوتاه، بدون کسر امتیاز.
+    if res and res.get("reason") == "duplicate":
+        try:
+            await msg.reply_text("♻️ این کلمه قبلاً گفته شده!")
+        except Exception:
+            pass
+        return True
+
+    # پاسخ اشتباه یا نامرتبط → حالت تمرکز را بررسی کن.
     return await _maybe_focus(ctx, s, msg, text, u, is_answer=res is not None)
+
 
 async def _maybe_focus(ctx, s, msg, text, u, is_answer):
     if not s.focus_mode:
@@ -581,7 +627,6 @@ async def _maybe_focus(ctx, s, msg, text, u, is_answer):
     too_long = len(text.split()) > FOCUS_WORD_LIMIT
     if is_answer or not too_long:
         return False
-    # سازنده و ادمین‌های گروه معاف‌اند
     if await _is_privileged(ctx, s, s.chat_id, u.id):
         return False
     await _safe_delete(msg)
@@ -603,6 +648,7 @@ async def handle_start_during_game(update, ctx):
     return await _warn_and_maybe_mute(
         ctx, s, chat.id, u, "وقتی بازی فعاله نمی‌تونی بازی جدید شروع کنی")
 
+
 def _load_category_for_session(s):
     if s.mode_id == "classic_choice" and not s.category:
         return False
@@ -614,47 +660,32 @@ def _load_category_for_session(s):
     s.words = db.list_words(s.category) or []
     return bool(s.words) or s.is_round_based()
 
+
 def _player_mentions(s):
     return " ".join(
         f'<a href="tg://user?id={uid}">{html.escape(info.get("name") or "بازیکن")}</a>'
-        for uid, info in s.players.items()
-    )
+        for uid, info in s.players.items())
+
 
 def _suggestion_hint(text):
     t = (text or "").strip()
-    return (
-        t.startswith("+کلمه")
-        or t.startswith("پیشنهاد کلمه")
-        or t.startswith("/suggest")
-    )
+    return (t.startswith("+کلمه") or t.startswith("پیشنهاد کلمه")
+            or t.startswith("/suggest"))
+
 
 async def _handle_group_suggestion(update, ctx, s, text):
     from features import suggestion_service as ss
-
     raw = text.strip()
-
     for prefix in ("+کلمه", "پیشنهاد کلمه", "/suggest"):
         if raw.startswith(prefix):
             raw = raw[len(prefix):].strip()
             break
-
     parts = [p.strip() for p in raw.split("|")]
-
     if len(parts) < 2:
-        return await update.message.reply_text(
-            "فرمت: +کلمه کلمه | دسته | توضیح اختیاری"
-        )
-
+        return await update.message.reply_text("فرمت: +کلمه کلمه | دسته | توضیح اختیاری")
     u = update.effective_user
-
     ok, msg = ss.create(
-        u.id,
-        u.first_name,
-        parts[0],
-        parts[1],
-        parts[2] if len(parts) > 2 else "",
-        source="game",
-    )
-
+        u.id, u.first_name, parts[0], parts[1],
+        parts[2] if len(parts) > 2 else "", source="game")
     await update.message.reply_text(("✅ " if ok else "⚠️ ") + msg)
     return True

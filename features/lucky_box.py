@@ -1,10 +1,21 @@
 # -*- coding: utf-8 -*-
-"""Lucky Box بعد از پایان مسابقه."""
+"""🎁 جعبه شانس بعد از پایان مسابقه.
 
+Phase 1: احتمال ظاهر شدن به‌طور محسوس کاهش یافت (۰٫۲۵ → ۰٫۱۰) و نام در همه‌جا
+از «Lucky Box» به «🎁 جعبه شانس» تغییر کرد.
+"""
+
+import logging
 import random
 from core import db, progression as pr
 
-DROP_CHANCE = 0.25
+logger = logging.getLogger("kalemo.luckybox")
+
+# نام نمایشی واحد برای استفاده در UI/پیام‌ها/لاگ‌ها.
+BOX_NAME = "🎁 جعبه شانس"
+
+# احتمال ظاهر شدن جعبه شانس بعد از هر مسابقه (به‌ازای هر بازیکن).
+DROP_CHANCE = 0.10
 
 ITEMS = [
     {"type": "coin", "value": 30, "rarity": "common", "weight": 40},
@@ -24,33 +35,38 @@ def _pick_item():
 
 
 def try_grant(uid, match_id=None):
-    if random.random() > DROP_CHANCE:
+    """با احتمال DROP_CHANCE یک جعبه شانس به بازیکن می‌دهد.
+
+    خطاها لاگ می‌شوند و None برمی‌گردد تا هرگز جریان پایان بازی را نشکنند.
+    """
+    try:
+        if random.random() > DROP_CHANCE:
+            return None
+
+        item = _pick_item()
+        p = db.get_player(uid)
+        if not p:
+            return None
+
+        if item["type"] == "coin":
+            db.save_player(uid, coins=p["coins"] + int(item["value"]))
+        elif item["type"] == "xp":
+            lvl, xp, _ = pr.add_xp(p["level"], p["xp"], int(item["value"]))
+            db.save_player(uid, level=lvl, xp=xp)
+
+        # title/badge/profile_frame/seed فعلاً فقط در جدول ذخیره می‌شوند.
+        db.add_lucky_box(
+            user_id=uid,
+            match_id=match_id,
+            item_type=item["type"],
+            item_value=item["value"],
+            rarity=item["rarity"],
+        )
+        logger.info("جعبه شانس به کاربر %s داده شد: %s", uid, item)
+        return item
+    except Exception:
+        logger.exception("خطا در اعطای جعبه شانس به کاربر %s", uid)
         return None
-
-    item = _pick_item()
-    p = db.get_player(uid)
-
-    if not p:
-        return None
-
-    if item["type"] == "coin":
-        db.save_player(uid, coins=p["coins"] + int(item["value"]))
-
-    elif item["type"] == "xp":
-        lvl, xp, _ = pr.add_xp(p["level"], p["xp"], int(item["value"]))
-        db.save_player(uid, level=lvl, xp=xp)
-
-    # title, badge, profile_frame, seed فعلاً فقط در lucky_boxes ذخیره می‌شوند
-    # (برای استفاده در سیستم‌های آینده مثل پروفایل/باغچه).
-    db.add_lucky_box(
-        user_id=uid,
-        match_id=match_id,
-        item_type=item["type"],
-        item_value=item["value"],
-        rarity=item["rarity"]
-    )
-
-    return item
 
 
 def item_text(item):

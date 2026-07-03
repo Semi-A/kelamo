@@ -21,12 +21,19 @@ FILE: config.py
 """
 import os
 from dotenv import load_dotenv
-# توکن ربات (از @BotFather) — حتماً به‌صورت متغیر محیطی ست شود.
-
 
 load_dotenv()
+
+# توکن ربات (از @BotFather) — حتماً به‌صورت متغیر محیطی ست شود.
 BOT_TOKEN = os.getenv("KALEMO_BOT_TOKEN")
+
+# آدرس اتصال به PostgreSQL. روی Render مقدار «Internal Database URL» را اینجا بگذارید.
+# مثال: postg://user:pass@host:5432/dbname
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# حداکثر اندازه‌ی connection pool. روی پلن رایگان Render کوچک نگه دارید.
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "5"))
+
 # یوزرنیم ربات (بدون @) — برای لینک افزودن به گروه
 BOT_USERNAME = os.getenv("KALEMO_BOT_USERNAME")
 
@@ -36,7 +43,7 @@ ADMIN_IDS = {
     if x.strip().lstrip("-").isdigit()
 }
 
-# مسیر دیتابیس
+# مسیر دیتابیس SQLite دیگر استفاده نمی‌شود؛ فقط برای سازگاری عقب‌رو نگه داشته شده.
 DB_PATH = os.environ.get("KALEMO_DB", "kalemo.db")
 
 # فاصله زمانی مجاز برای تغییر نام نمایشی (ثانیه) — پیش‌فرض ۷ روز
@@ -60,54 +67,106 @@ FILE: core\db.py
 
 ```py
 # -*- coding: utf-8 -*-
-"""لایه دیتابیس Kalemo.
+"""لایه دیتابیس Kalemo — نسخه‌ی PostgreSQL.
 
-شامل:
-- بازیکنان و نام نمایشی
-- ماموریت‌های روزانه
-- دسته‌بندی و کلمات (با نرمال‌سازی برای مقایسه)
-- پیشنهاد کلمات توسط کاربران
-- گزارش مسابقات
-- لاگ تغییرات ادمین
-- Lucky Box
-- ادمین‌های همکار
+این فایل جایگزین نسخه‌ی SQLite است. تمام امضاهای توابع عمومی (public API)
+دقیقاً مثل قبل باقی مانده‌اند، بنابراین هیچ فایل دیگری در پروژه نیازی به
+تغییر ندارد. فقط لایه‌ی ذخیره‌سازی از SQLite به PostgreSQL منتقل شده است.
+
+نکات مهاجرت:
+- به‌جای sqlite3 از psycopg (نسخه ۳) استفاده می‌شود.
+- کانکشن از طریق یک ConnectionPool مدیریت می‌شود (مناسب پلن رایگان Render).
+- placeholder پارامترها از «?» به «%s» تغییر کرده است.
+- AUTOINCREMENT → GENERATED / SERIAL (اینجا از GENERATED ALWAYS AS IDENTITY).
+- lastrowid → INSERT ... RETURNING id.
+- INSERT OR IGNORE → INSERT ... ON CONFLICT DO NOTHING.
+- executescript → execute (psycopg چند دستور را در یک رشته اجرا می‌کند).
+- خطای یکتایی sqlite3.IntegrityError → psycopg.errors.UniqueViolation.
+- PRAGMA table_info → information_schema.columns.
 """
 
-import re
-import psycopg
-import os
-import config
 import time
 from contextlib import contextmanager
-from core.garden_db import init_garden
-import config
 
-DB_PATH = config.DB_PATH
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+import config
+from core.garden_db import init_garden
+
+# سازگاری عقب‌رو: هر جای پروژه که db.IntegrityError را می‌گیرد کار کند.
+IntegrityError = psycopg.errors.UniqueViolation
+
+# ---------- connection pool ----------
+# روی پلن رایگان Render تعداد کانکشن‌ها محدود است؛ pool کوچک نگه داشته می‌شود.
+_DSN = config.DATABASE_URL
+if not _DSN:
+    raise RuntimeError(
+        "DATABASE_URL تنظیم نشده است. در Render → Environment مقدار "
+        "Internal Database URL دیتابیس PostgreSQL را ست کنید."
+    )
+
+_pool = ConnectionPool(
+    conninfo=_DSN,
+    min_size=1,
+    max_size=int(config.DB_POOL_MAX),
+    kwargs={"row_factory": dict_row, "autocommit": False},
+    open=True,
+)
 
 
 @contextmanager
 def conn():
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield c
-        c.commit()
-    finally:
-        c.close()
+    """یک کانکشن از pool می‌گیرد، cursor با دسترسی مثل dict برمی‌گرداند.
+
+    برای حفظ سازگاری با کد قدیمی، شیءِ yield شده یک wrapper است که
+    متد execute() آن یک cursor برمی‌گرداند (دقیقاً مثل sqlite3.Connection.execute).
+    """
+    with _pool.connection() as c:
+        try:
+            yield _ConnShim(c)
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+
+
+class _ConnShim:
+    """سازگاری با API قدیمی sqlite3.
+
+    در sqlite3، connection.execute(sql, params) خودش یک cursor برمی‌گرداند
+    که می‌شود روی آن fetchone/fetchall/rowcount صدا زد. اینجا همان رفتار را
+    شبیه‌سازی می‌کنیم تا کوئری‌های موجود بدون تغییر کار کنند.
+    """
+
+    def __init__(self, real_conn):
+        self._c = real_conn
+
+    def execute(self, sql, params=()):
+        # ترجمه‌ی خودکار placeholder «?» به «%s» تا کوئری‌ها دست‌نخورده بمانند.
+        if "?" in sql:
+            sql = sql.replace("?", "%s")
+        cur = self._c.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def cursor(self):
+        return self._c.cursor()
 
 
 # ---------- normalization ----------
-
-# ---------- normalization ----------
-from core.normalize import normalize_word  # noqa: F401  (سازگاری عقب‌رو)
+from core.normalize import normalize_word  # noqa: E402,F401  (سازگاری عقب‌رو)
 
 
 # ---------- schema helpers ----------
 
 def _table_columns(c, table):
-    rows = c.execute(f"PRAGMA table_info({table})").fetchall()
-    return {r["name"] for r in rows}
+    rows = c.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name=%s",
+        (table,),
+    ).fetchall()
+    return {r["column_name"] for r in rows}
 
 
 def _ensure_column(c, table, column, ddl):
@@ -117,12 +176,13 @@ def _ensure_column(c, table, column, ddl):
 
 def init():
     with conn() as c:
-        c.executescript("""
+        # در PostgreSQL کلید افزایشی با IDENTITY ساخته می‌شود.
+        c.execute("""
         CREATE TABLE IF NOT EXISTS players (
-            user_id         INTEGER PRIMARY KEY,
+            user_id         BIGINT PRIMARY KEY,
             name            TEXT,
             display_name    TEXT,
-            name_changed_at INTEGER DEFAULT 0,
+            name_changed_at BIGINT DEFAULT 0,
             level           INTEGER DEFAULT 1,
             xp              INTEGER DEFAULT 0,
             coins           INTEGER DEFAULT 0,
@@ -133,11 +193,11 @@ def init():
             best_score      INTEGER DEFAULT 0,
             onboarded       INTEGER DEFAULT 0,
             accepted_words  INTEGER DEFAULT 0,
-            created_at      INTEGER
+            created_at      BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS mission_progress (
-            user_id   INTEGER,
+            user_id   BIGINT,
             day       TEXT,
             progress  INTEGER DEFAULT 0,
             claimed   INTEGER DEFAULT 0,
@@ -145,12 +205,12 @@ def init():
         );
 
         CREATE TABLE IF NOT EXISTS categories (
-            id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            id    INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             name  TEXT UNIQUE
         );
 
         CREATE TABLE IF NOT EXISTS words (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            id              INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             category_id     INTEGER NOT NULL,
             word            TEXT NOT NULL,
             normalized_word TEXT DEFAULT '',
@@ -160,21 +220,21 @@ def init():
             synonyms        TEXT DEFAULT '',
             clue            TEXT DEFAULT '',
             usage_count     INTEGER DEFAULT 0,
-            last_used_by    INTEGER,
-            last_used_at    INTEGER,
+            last_used_by    BIGINT,
+            last_used_at    BIGINT,
             UNIQUE(category_id, word),
             FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS admins (
-            user_id  INTEGER PRIMARY KEY,
-            added_by INTEGER,
-            added_at INTEGER
+            user_id  BIGINT PRIMARY KEY,
+            added_by BIGINT,
+            added_at BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS word_suggestions (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id         INTEGER,
+            id              INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            user_id         BIGINT,
             user_name       TEXT,
             word            TEXT NOT NULL,
             normalized_word TEXT DEFAULT '',
@@ -182,46 +242,46 @@ def init():
             description     TEXT DEFAULT '',
             source          TEXT DEFAULT 'menu',
             status          TEXT DEFAULT 'pending',
-            admin_id        INTEGER,
+            admin_id        BIGINT,
             admin_note      TEXT DEFAULT '',
-            created_at      INTEGER,
-            reviewed_at     INTEGER
+            created_at      BIGINT,
+            reviewed_at     BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS match_reports (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id     INTEGER,
+            id          INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            chat_id     BIGINT,
             mode        TEXT,
-            winner_id   INTEGER,
+            winner_id   BIGINT,
             players     INTEGER DEFAULT 0,
-            created_at  INTEGER
+            created_at  BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS change_logs (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id    INTEGER,
+            id          INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            admin_id    BIGINT,
             action      TEXT,
             target_type TEXT,
             target_id   TEXT,
             detail      TEXT,
-            created_at  INTEGER
+            created_at  BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS lucky_boxes (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     INTEGER,
-            match_id    INTEGER,
+            id          INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            user_id     BIGINT,
+            match_id    BIGINT,
             item_type   TEXT,
             item_value  TEXT,
             rarity      TEXT,
             opened      INTEGER DEFAULT 1,
-            created_at  INTEGER
+            created_at  BIGINT
         );
         """)
 
         # ---- migrations برای دیتابیس‌های قدیمی ----
         _ensure_column(c, "players", "display_name", "display_name TEXT")
-        _ensure_column(c, "players", "name_changed_at", "name_changed_at INTEGER DEFAULT 0")
+        _ensure_column(c, "players", "name_changed_at", "name_changed_at BIGINT DEFAULT 0")
         _ensure_column(c, "players", "accepted_words", "accepted_words INTEGER DEFAULT 0")
 
         _ensure_column(c, "words", "difficulty", "difficulty INTEGER DEFAULT 1")
@@ -231,27 +291,28 @@ def init():
         _ensure_column(c, "words", "clue", "clue TEXT DEFAULT ''")
         _ensure_column(c, "words", "normalized_word", "normalized_word TEXT DEFAULT ''")
         _ensure_column(c, "words", "usage_count", "usage_count INTEGER DEFAULT 0")
-        _ensure_column(c, "words", "last_used_by", "last_used_by INTEGER")
-        _ensure_column(c, "words", "last_used_at", "last_used_at INTEGER")
+        _ensure_column(c, "words", "last_used_by", "last_used_by BIGINT")
+        _ensure_column(c, "words", "last_used_at", "last_used_at BIGINT")
 
         c.execute("UPDATE words SET normalized_word='' WHERE normalized_word IS NULL")
 
         rows = c.execute("SELECT id, word FROM words WHERE normalized_word=''").fetchall()
         for r in rows:
             c.execute(
-                "UPDATE words SET normalized_word=? WHERE id=?",
-                (normalize_word(r["word"]), r["id"])
+                "UPDATE words SET normalized_word=%s WHERE id=%s",
+                (normalize_word(r["word"]), r["id"]),
             )
 
         c.execute("CREATE INDEX IF NOT EXISTS ix_words_normalized ON words(category_id, normalized_word)")
         c.execute("CREATE INDEX IF NOT EXISTS ix_suggestions_status ON word_suggestions(status)")
 
+        # partial unique index (نحو یکسان در Postgres)
         c.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS ux_players_display_name
         ON players(display_name)
         WHERE display_name IS NOT NULL AND TRIM(display_name) <> ''
         """)
-        
+
         init_garden(c)
 
     seed_defaults()
@@ -262,7 +323,7 @@ def init():
 
 def get_player(uid):
     with conn() as c:
-        r = c.execute("SELECT * FROM players WHERE user_id=?", (uid,)).fetchone()
+        r = c.execute("SELECT * FROM players WHERE user_id=%s", (uid,)).fetchone()
     return dict(r) if r else None
 
 
@@ -275,13 +336,14 @@ def ensure_player(uid, name):
     if p:
         if name and p.get("name") != name:
             with conn() as c:
-                c.execute("UPDATE players SET name=? WHERE user_id=?", (name, uid))
+                c.execute("UPDATE players SET name=%s WHERE user_id=%s", (name, uid))
         return get_player(uid)
 
     with conn() as c:
         c.execute(
-            "INSERT INTO players(user_id, name, created_at) VALUES (?, ?, ?)",
-            (uid, name or "", int(time.time()))
+            "INSERT INTO players(user_id, name, created_at) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id) DO NOTHING",
+            (uid, name or "", int(time.time())),
         )
     return get_player(uid)
 
@@ -296,10 +358,10 @@ def save_player(uid, **fields):
         if bad:
             raise ValueError(f"Invalid player field(s): {', '.join(bad)}")
 
-        cols = ", ".join(f"{k}=?" for k in fields)
+        cols = ", ".join(f"{k}=%s" for k in fields)
         values = list(fields.values())
         values.append(uid)
-        c.execute(f"UPDATE players SET {cols} WHERE user_id=?", values)
+        c.execute(f"UPDATE players SET {cols} WHERE user_id=%s", values)
 
 
 def is_onboarded(uid):
@@ -337,13 +399,13 @@ def is_display_name_taken(name, exclude_uid=None):
     with conn() as c:
         if exclude_uid is None:
             r = c.execute(
-                "SELECT 1 FROM players WHERE display_name=? LIMIT 1",
-                (name,)
+                "SELECT 1 FROM players WHERE display_name=%s LIMIT 1",
+                (name,),
             ).fetchone()
         else:
             r = c.execute(
-                "SELECT 1 FROM players WHERE display_name=? AND user_id<>? LIMIT 1",
-                (name, exclude_uid)
+                "SELECT 1 FROM players WHERE display_name=%s AND user_id<>%s LIMIT 1",
+                (name, exclude_uid),
             ).fetchone()
     return r is not None
 
@@ -358,13 +420,13 @@ def set_display_name(uid, name):
         raise ValueError("display name cannot be empty")
 
     if is_display_name_taken(name, exclude_uid=uid):
-        raise sqlite3.IntegrityError("display name already taken")
+        raise IntegrityError("display name already taken")
 
     ensure_player(uid, "")
     with conn() as c:
         c.execute(
-            "UPDATE players SET display_name=?, name_changed_at=? WHERE user_id=?",
-            (name, int(time.time()), uid)
+            "UPDATE players SET display_name=%s, name_changed_at=%s WHERE user_id=%s",
+            (name, int(time.time()), uid),
         )
 
 
@@ -383,8 +445,8 @@ def stats():
 def get_mission_progress(uid, day):
     with conn() as c:
         r = c.execute(
-            "SELECT * FROM mission_progress WHERE user_id=? AND day=?",
-            (uid, day)
+            "SELECT * FROM mission_progress WHERE user_id=%s AND day=%s",
+            (uid, day),
         ).fetchone()
     return dict(r) if r else {"user_id": uid, "day": day, "progress": 0, "claimed": 0}
 
@@ -393,9 +455,9 @@ def bump_mission(uid, day, amount=1):
     with conn() as c:
         c.execute("""
         INSERT INTO mission_progress(user_id, day, progress)
-        VALUES (?, ?, ?)
+        VALUES (%s, %s, %s)
         ON CONFLICT(user_id, day)
-        DO UPDATE SET progress = progress + ?
+        DO UPDATE SET progress = mission_progress.progress + %s
         """, (uid, day, amount, amount))
 
 
@@ -403,10 +465,11 @@ def claim_mission(uid, day):
     with conn() as c:
         c.execute("""
         INSERT INTO mission_progress(user_id, day, claimed)
-        VALUES (?, ?, 1)
+        VALUES (%s, %s, 1)
         ON CONFLICT(user_id, day)
         DO UPDATE SET claimed = 1
         """, (uid, day))
+
 
 def claim_mission_atomic(uid, day, coins, xp):
     """اتمیک: اگر قبلاً claim نشده، claim را ثبت و سکه/XP را اعمال می‌کند.
@@ -414,20 +477,19 @@ def claim_mission_atomic(uid, day, coins, xp):
     from core.progression import add_xp
     with conn() as c:
         row = c.execute(
-            "SELECT claimed FROM mission_progress WHERE user_id=? AND day=?",
+            "SELECT claimed FROM mission_progress WHERE user_id=%s AND day=%s",
             (uid, day)).fetchone()
         if row and row["claimed"]:
             return False
-        # ثبت claim (اتمیک در همین تراکنش)
         c.execute("""INSERT INTO mission_progress(user_id, day, claimed)
-                     VALUES (?, ?, 1)
+                     VALUES (%s, %s, 1)
                      ON CONFLICT(user_id, day) DO UPDATE SET claimed=1""",
                   (uid, day))
-        p = c.execute("SELECT level, xp, coins FROM players WHERE user_id=?",
+        p = c.execute("SELECT level, xp, coins FROM players WHERE user_id=%s",
                       (uid,)).fetchone()
         if p:
             new_level, new_xp, _ = add_xp(p["level"], p["xp"], xp)
-            c.execute("UPDATE players SET coins=?, level=?, xp=? WHERE user_id=?",
+            c.execute("UPDATE players SET coins=%s, level=%s, xp=%s WHERE user_id=%s",
                       (p["coins"] + coins, new_level, new_xp, uid))
     return True
 
@@ -435,18 +497,31 @@ def claim_mission_atomic(uid, day, coins, xp):
 # ---------- leaderboard ----------
 
 def top_players(limit=10):
+    """لیدربورد کلی بر اساس best_score.
+
+    مرتب‌سازی قطعی (deterministic) طبق game.ranking:
+      1) best_score نزولی  2) wins نزولی  3) user_id صعودی (ثبت‌نام زودتر)
+    این تضمین می‌کند بازیکن با امتیاز کمتر هرگز بالاتر از بازیکن با امتیاز بیشتر
+    نمایش داده نشود، و در تساوی همیشه ترتیب یکسان و قطعی باشد.
+    خروجی نهایی قبل از برگشت با ranking.assert_sorted اعتبارسنجی می‌شود.
+    """
+    from game import ranking
     with conn() as c:
         rows = c.execute("""
         SELECT
             COALESCE(NULLIF(display_name, ''), name, 'کاربر') AS shown_name,
-            level,
-            best_score
+            best_score,
+            wins,
+            user_id
         FROM players
-        ORDER BY level DESC, best_score DESC, wins DESC
-        LIMIT ?
+        ORDER BY best_score DESC, wins DESC, user_id ASC
+        LIMIT %s
         """, (limit,)).fetchall()
 
-    return [(r["shown_name"], r["best_score"]) for r in rows]
+    result = [(r["shown_name"], r["best_score"]) for r in rows]
+    # گارد نهایی: اگر به هر دلیلی ترتیب خراب بود، همین‌جا شکست می‌خورد.
+    ranking.assert_sorted(result, score_getter=lambda t: t[1])
+    return result
 
 
 # ---------- categories & words ----------
@@ -458,21 +533,21 @@ def add_category(name):
 
     try:
         with conn() as c:
-            c.execute("INSERT INTO categories(name) VALUES (?)", (name,))
+            c.execute("INSERT INTO categories(name) VALUES (%s)", (name,))
         return True
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return False
 
 
 def del_category(name):
     with conn() as c:
-        cur = c.execute("DELETE FROM categories WHERE name=?", ((name or "").strip(),))
+        cur = c.execute("DELETE FROM categories WHERE name=%s", ((name or "").strip(),))
         return cur.rowcount > 0
 
 
 def get_category(name):
     with conn() as c:
-        r = c.execute("SELECT * FROM categories WHERE name=?", ((name or "").strip(),)).fetchone()
+        r = c.execute("SELECT * FROM categories WHERE name=%s", ((name or "").strip(),)).fetchone()
     return dict(r) if r else None
 
 
@@ -499,7 +574,7 @@ def find_word(category, word):
         r = c.execute("""
             SELECT *
             FROM words
-            WHERE category_id=? AND normalized_word=?
+            WHERE category_id=%s AND normalized_word=%s
             LIMIT 1
         """, (cat["id"], nw)).fetchone()
 
@@ -536,7 +611,7 @@ def add_word(category, word, difficulty=1, rarity=1, points=10, synonyms="", clu
                     category_id, word, normalized_word,
                     difficulty, rarity, points, synonyms, clue
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 cat["id"],
                 word,
@@ -548,7 +623,7 @@ def add_word(category, word, difficulty=1, rarity=1, points=10, synonyms="", clu
                 clue or "",
             ))
         return True
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return False
 
 
@@ -559,8 +634,8 @@ def del_word(category, word):
 
     with conn() as c:
         cur = c.execute(
-            "DELETE FROM words WHERE category_id=? AND word=?",
-            (cat["id"], (word or "").strip())
+            "DELETE FROM words WHERE category_id=%s AND word=%s",
+            (cat["id"], (word or "").strip()),
         )
         return cur.rowcount > 0
 
@@ -572,8 +647,8 @@ def list_words(category):
 
     with conn() as c:
         rows = c.execute(
-            "SELECT word FROM words WHERE category_id=? ORDER BY word",
-            (cat["id"],)
+            "SELECT word FROM words WHERE category_id=%s ORDER BY word",
+            (cat["id"],),
         ).fetchall()
 
     return [r["word"] for r in rows]
@@ -588,7 +663,7 @@ def lex_rows(category):
         rows = c.execute("""
         SELECT word, difficulty, rarity, points, synonyms, clue, usage_count
         FROM words
-        WHERE category_id=?
+        WHERE category_id=%s
         ORDER BY word
         """, (cat["id"],)).fetchall()
 
@@ -617,9 +692,9 @@ def bump_word_use(category, word, user_id=None):
         cur = c.execute("""
         UPDATE words
         SET usage_count = COALESCE(usage_count, 0) + 1,
-            last_used_by = ?,
-            last_used_at = ?
-        WHERE category_id=? AND word=?
+            last_used_by = %s,
+            last_used_at = %s
+        WHERE category_id=%s AND word=%s
         """, (user_id, int(time.time()), cat["id"], (word or "").strip()))
         return cur.rowcount > 0
 
@@ -629,6 +704,7 @@ def random_category():
 
     cats = [n for n, cnt in list_categories() if cnt > 0]
     return random.choice(cats) if cats else None
+
 
 def import_words(records):
     added = 0
@@ -643,19 +719,19 @@ def import_words(records):
             if not word or not category:
                 skipped += 1
                 continue
-            cat = c.execute("SELECT id FROM categories WHERE name=?", (category,)).fetchone()
+            cat = c.execute("SELECT id FROM categories WHERE name=%s", (category,)).fetchone()
             if not cat:
                 try:
-                    c.execute("INSERT INTO categories(name) VALUES (?)", (category,))
-                    cat_id = c.execute("SELECT id FROM categories WHERE name=?", (category,)).fetchone()["id"]
-                except sqlite3.IntegrityError:
+                    c.execute("INSERT INTO categories(name) VALUES (%s)", (category,))
+                    cat_id = c.execute("SELECT id FROM categories WHERE name=%s", (category,)).fetchone()["id"]
+                except IntegrityError:
                     skipped += 1
                     continue
             else:
                 cat_id = cat["id"]
             nw = normalize_word(word)
             exists = c.execute(
-                "SELECT 1 FROM words WHERE category_id=? AND normalized_word=? LIMIT 1",
+                "SELECT 1 FROM words WHERE category_id=%s AND normalized_word=%s LIMIT 1",
                 (cat_id, nw)).fetchone()
             if exists:
                 skipped += 1
@@ -663,7 +739,7 @@ def import_words(records):
             try:
                 c.execute("""INSERT INTO words(category_id, word, normalized_word,
                              difficulty, rarity, points, synonyms, clue)
-                             VALUES (?,?,?,?,?,?,?,?)""",
+                             VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
                           (cat_id, word, nw,
                            int(r.get("difficulty", 1) or 1),
                            int(r.get("rarity", 1) or 1),
@@ -671,7 +747,7 @@ def import_words(records):
                            r.get("synonyms", "") or "",
                            r.get("clue", "") or ""))
                 added += 1
-            except sqlite3.IntegrityError:
+            except IntegrityError:
                 skipped += 1
     return added, skipped
 
@@ -712,7 +788,7 @@ def add_suggestion(user_id, user_name, word, category, description="", source="m
 
         if cat_id:
             dup = c.execute(
-                "SELECT 1 FROM words WHERE category_id=? AND normalized_word=? LIMIT 1",
+                "SELECT 1 FROM words WHERE category_id=%s AND normalized_word=%s LIMIT 1",
                 (cat_id, normalize_word(word))
             ).fetchone()
 
@@ -721,7 +797,7 @@ def add_suggestion(user_id, user_name, word, category, description="", source="m
 
         pending = c.execute(
             """SELECT 1 FROM word_suggestions
-               WHERE category=? AND normalized_word=? 
+               WHERE category=%s AND normalized_word=%s
                AND status='pending' LIMIT 1""",
             (category, normalize_word(word))
         ).fetchone()
@@ -734,7 +810,7 @@ def add_suggestion(user_id, user_name, word, category, description="", source="m
                 user_id, user_name, word, normalized_word,
                 category, description, source, status, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s)
         """, (
             user_id,
             user_name or "",
@@ -756,7 +832,7 @@ def pending_suggestions(limit=10):
             FROM word_suggestions
             WHERE status='pending'
             ORDER BY created_at ASC
-            LIMIT ?
+            LIMIT %s
         """, (limit,)).fetchall()
 
     return [dict(r) for r in rows]
@@ -765,11 +841,12 @@ def pending_suggestions(limit=10):
 def get_suggestion(sid):
     with conn() as c:
         r = c.execute(
-            "SELECT * FROM word_suggestions WHERE id=?",
+            "SELECT * FROM word_suggestions WHERE id=%s",
             (sid,)
         ).fetchone()
 
     return dict(r) if r else None
+
 
 def approve_suggestion(sid, admin_id, new_word=None, new_category=None):
     s = get_suggestion(sid)
@@ -782,35 +859,36 @@ def approve_suggestion(sid, admin_id, new_word=None, new_category=None):
     now = int(time.time())
 
     with conn() as c:
-        cat = c.execute("SELECT id FROM categories WHERE name=?", (category,)).fetchone()
+        cat = c.execute("SELECT id FROM categories WHERE name=%s", (category,)).fetchone()
         if not cat:
-            c.execute("INSERT INTO categories(name) VALUES (?)", (category,))
-            cat_id = c.execute("SELECT id FROM categories WHERE name=?", (category,)).fetchone()["id"]
+            c.execute("INSERT INTO categories(name) VALUES (%s)", (category,))
+            cat_id = c.execute("SELECT id FROM categories WHERE name=%s", (category,)).fetchone()["id"]
         else:
             cat_id = cat["id"]
 
-        dup = c.execute("SELECT 1 FROM words WHERE category_id=? AND normalized_word=? LIMIT 1",
+        dup = c.execute("SELECT 1 FROM words WHERE category_id=%s AND normalized_word=%s LIMIT 1",
                         (cat_id, nw)).fetchone()
         ok = False
         if not dup:
             try:
                 c.execute("""INSERT INTO words(category_id, word, normalized_word)
-                             VALUES (?,?,?)""", (cat_id, word, nw))
+                             VALUES (%s,%s,%s)""", (cat_id, word, nw))
                 ok = True
-            except sqlite3.IntegrityError:
+            except IntegrityError:
                 ok = False
 
         c.execute("""UPDATE word_suggestions
-                     SET status='approved', word=?, normalized_word=?, category=?,
-                         admin_id=?, reviewed_at=? WHERE id=?""",
+                     SET status='approved', word=%s, normalized_word=%s, category=%s,
+                         admin_id=%s, reviewed_at=%s WHERE id=%s""",
                   (word, nw, category, admin_id, now, sid))
-        c.execute("UPDATE players SET accepted_words=COALESCE(accepted_words,0)+1 WHERE user_id=?",
+        c.execute("UPDATE players SET accepted_words=COALESCE(accepted_words,0)+1 WHERE user_id=%s",
                   (s["user_id"],))
         c.execute("""INSERT INTO change_logs(admin_id, action, target_type, target_id, detail, created_at)
-                     VALUES (?, 'approve_suggestion', 'word_suggestion', ?, ?, ?)""",
+                     VALUES (%s, 'approve_suggestion', 'word_suggestion', %s, %s, %s)""",
                   (admin_id, str(sid), f"{word} -> {category}, inserted={ok}", now))
 
     return True, "پیشنهاد تأیید شد و کلمه به دیتابیس اضافه شد."
+
 
 def reject_suggestion(sid, admin_id, note=""):
     s = get_suggestion(sid)
@@ -821,10 +899,10 @@ def reject_suggestion(sid, admin_id, note=""):
         c.execute("""
             UPDATE word_suggestions
             SET status='rejected',
-                admin_id=?,
-                admin_note=?,
-                reviewed_at=?
-            WHERE id=?
+                admin_id=%s,
+                admin_note=%s,
+                reviewed_at=%s
+            WHERE id=%s
         """, (
             admin_id,
             note or "",
@@ -834,7 +912,7 @@ def reject_suggestion(sid, admin_id, note=""):
 
         c.execute("""
             INSERT INTO change_logs(admin_id, action, target_type, target_id, detail, created_at)
-            VALUES (?, 'reject_suggestion', 'word_suggestion', ?, ?, ?)
+            VALUES (%s, 'reject_suggestion', 'word_suggestion', %s, %s, %s)
         """, (
             admin_id,
             str(sid),
@@ -857,12 +935,12 @@ def edit_suggestion(sid, admin_id, word=None, category=None, description=None):
     with conn() as c:
         c.execute("""
             UPDATE word_suggestions
-            SET word=?,
-                normalized_word=?,
-                category=?,
-                description=?,
-                admin_id=?
-            WHERE id=?
+            SET word=%s,
+                normalized_word=%s,
+                category=%s,
+                description=%s,
+                admin_id=%s
+            WHERE id=%s
         """, (
             new_word,
             normalize_word(new_word),
@@ -874,7 +952,7 @@ def edit_suggestion(sid, admin_id, word=None, category=None, description=None):
 
         c.execute("""
             INSERT INTO change_logs(admin_id, action, target_type, target_id, detail, created_at)
-            VALUES (?, 'edit_suggestion', 'word_suggestion', ?, ?, ?)
+            VALUES (%s, 'edit_suggestion', 'word_suggestion', %s, %s, %s)
         """, (
             admin_id,
             str(sid),
@@ -890,13 +968,13 @@ def suggestion_stats_for_user(uid):
         total = c.execute("""
             SELECT COUNT(*) n
             FROM word_suggestions
-            WHERE user_id=?
+            WHERE user_id=%s
         """, (uid,)).fetchone()["n"]
 
         approved = c.execute("""
             SELECT COUNT(*) n
             FROM word_suggestions
-            WHERE user_id=? AND status='approved'
+            WHERE user_id=%s AND status='approved'
         """, (uid,)).fetchone()["n"]
 
     return {"total": total, "approved": approved}
@@ -908,7 +986,8 @@ def add_match_report(chat_id, mode, winner_id, players_count):
     with conn() as c:
         cur = c.execute("""
             INSERT INTO match_reports(chat_id, mode, winner_id, players, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
         """, (
             chat_id,
             mode,
@@ -916,7 +995,7 @@ def add_match_report(chat_id, mode, winner_id, players_count):
             players_count,
             int(time.time())
         ))
-        return cur.lastrowid
+        return cur.fetchone()["id"]
 
 
 def latest_match_reports(limit=10):
@@ -925,7 +1004,7 @@ def latest_match_reports(limit=10):
             SELECT *
             FROM match_reports
             ORDER BY created_at DESC
-            LIMIT ?
+            LIMIT %s
         """, (limit,)).fetchall()
 
     return [dict(r) for r in rows]
@@ -937,7 +1016,7 @@ def add_lucky_box(user_id, match_id, item_type, item_value, rarity):
     with conn() as c:
         c.execute("""
             INSERT INTO lucky_boxes(user_id, match_id, item_type, item_value, rarity, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             match_id,
@@ -952,21 +1031,22 @@ def add_lucky_box(user_id, match_id, item_type, item_value, rarity):
 
 def is_db_admin(uid):
     with conn() as c:
-        r = c.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)).fetchone()
+        r = c.execute("SELECT 1 FROM admins WHERE user_id=%s", (uid,)).fetchone()
     return r is not None
 
 
 def add_admin(uid, by):
     with conn() as c:
         c.execute("""
-        INSERT OR IGNORE INTO admins(user_id, added_by, added_at)
-        VALUES (?, ?, ?)
+        INSERT INTO admins(user_id, added_by, added_at)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id) DO NOTHING
         """, (uid, by, int(time.time())))
 
 
 def del_admin(uid):
     with conn() as c:
-        cur = c.execute("DELETE FROM admins WHERE user_id=?", (uid,))
+        cur = c.execute("DELETE FROM admins WHERE user_id=%s", (uid,))
         return cur.rowcount > 0
 
 
@@ -1000,27 +1080,28 @@ def seed_namefamily_words(clean_extra_categories=True):
             rows = c.execute("SELECT name FROM categories").fetchall()
             for r in rows:
                 if r["name"] not in allowed:
-                    c.execute("DELETE FROM categories WHERE name=?", (r["name"],))
+                    c.execute("DELETE FROM categories WHERE name=%s", (r["name"],))
         for cat in NAMEFAMILY_ALLOWED_CATEGORIES:
-            c.execute("INSERT OR IGNORE INTO categories(name) VALUES (?)", (cat,))
-            cat_id = c.execute("SELECT id FROM categories WHERE name=?", (cat,)).fetchone()["id"]
+            c.execute("INSERT INTO categories(name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (cat,))
+            cat_id = c.execute("SELECT id FROM categories WHERE name=%s", (cat,)).fetchone()["id"]
             for word in NAMEFAMILY_WORD_BANK.get(cat, []):
                 w = (word or "").strip()
                 if not w:
                     continue
                 nw = normalize_word(w)
-                exists = c.execute("SELECT 1 FROM words WHERE category_id=? AND normalized_word=? LIMIT 1", (cat_id, nw)).fetchone()
+                exists = c.execute("SELECT 1 FROM words WHERE category_id=%s AND normalized_word=%s LIMIT 1", (cat_id, nw)).fetchone()
                 if exists:
                     continue
                 c.execute("""
-                    INSERT OR IGNORE INTO words(category_id, word, normalized_word, difficulty, rarity, points)
-                    VALUES (?, ?, ?, 1, 1, 10)
+                    INSERT INTO words(category_id, word, normalized_word, difficulty, rarity, points)
+                    VALUES (%s, %s, %s, 1, 1, 10)
+                    ON CONFLICT (category_id, word) DO NOTHING
                 """, (cat_id, w, nw))
     return True
 
 
 # ---------- garden (delegation) ----------
-from core.garden_db import GardenAPI as _GardenAPI
+from core.garden_db import GardenAPI as _GardenAPI  # noqa: E402
 _garden = _GardenAPI(conn)
 
 def garden_ensure_starter(uid, name=""):        return _garden.ensure_starter(uid, name)
@@ -1037,6 +1118,7 @@ def garden_water_left(uid):                     return _garden.water_left(uid)
 def garden_water(uid, target_id):               return _garden.water(uid, target_id)
 def garden_public(uid):                         return _garden.public(uid)
 def garden_friend_gardens(uid, limit=8):        return _garden.friend_gardens(uid, limit)
+
 ```
 
 
@@ -1046,7 +1128,18 @@ FILE: core\garden_db.py
 
 ```py
 # -*- coding: utf-8 -*-
-"""لایه دیتابیس باغچه‌ی کلمو — کاملاً مستقل، فقط از conn() هسته استفاده می‌کند."""
+"""لایه دیتابیس باغچه‌ی کلمو — نسخه‌ی PostgreSQL.
+
+فقط از conn() هسته استفاده می‌کند. تمام امضاهای عمومی بدون تغییر مانده‌اند.
+
+تغییرات مهاجرت نسبت به نسخه‌ی SQLite:
+- executescript → execute (psycopg چند دستور در یک رشته را اجرا می‌کند).
+- placeholder «?» → «%s».
+- در UPSERT، ستون‌های جدول باید با نام جدول واجد شرایط شوند
+  (مثلاً garden_seeds.qty) چون در Postgres «qty» به‌تنهایی مبهم است.
+- AUTOINCREMENT وجود ندارد؛ این جدول‌ها کلید طبیعی دارند (نیازی نیست).
+- BIGINT برای user_id (آی‌دی‌های تلگرام بزرگ هستند).
+"""
 import random
 import time
 
@@ -1058,27 +1151,27 @@ HARVEST_AT = 100
 
 def init_garden(c):
     """جدول‌ها را می‌سازد. c یک اتصال باز از conn() است."""
-    c.executescript("""
+    c.execute("""
     CREATE TABLE IF NOT EXISTS garden_players (
-        user_id     INTEGER PRIMARY KEY,
+        user_id     BIGINT PRIMARY KEY,
         name        TEXT DEFAULT '',
         last_visit  TEXT DEFAULT '',
         water_day   TEXT DEFAULT '',
         water_used  INTEGER DEFAULT 0,
-        created_at  INTEGER
+        created_at  BIGINT
     );
     CREATE TABLE IF NOT EXISTS garden_trees (
-        user_id        INTEGER PRIMARY KEY,
+        user_id        BIGINT PRIMARY KEY,
         seed_type      TEXT DEFAULT 'کلمو',
         rarity         TEXT DEFAULT 'normal',
         growth         INTEGER DEFAULT 0,
         pending_coins  INTEGER DEFAULT 0,
         pending_xp     INTEGER DEFAULT 0,
         pending_boxes  INTEGER DEFAULT 0,
-        planted_at     INTEGER
+        planted_at     BIGINT
     );
     CREATE TABLE IF NOT EXISTS garden_seeds (
-        user_id    INTEGER,
+        user_id    BIGINT,
         seed_type  TEXT,
         qty        INTEGER DEFAULT 0,
         PRIMARY KEY (user_id, seed_type)
@@ -1104,37 +1197,40 @@ class GardenAPI:
     def ensure_starter(self, uid, name=""):
         with self._conn() as c:
             init_garden(c)
-            row = c.execute("SELECT 1 FROM garden_players WHERE user_id=?", (uid,)).fetchone()
+            row = c.execute("SELECT 1 FROM garden_players WHERE user_id=%s", (uid,)).fetchone()
             if not row:
-                c.execute("INSERT INTO garden_players(user_id, name, created_at) VALUES (?,?,?)",
+                c.execute("INSERT INTO garden_players(user_id, name, created_at) VALUES (%s,%s,%s) "
+                          "ON CONFLICT (user_id) DO NOTHING",
                           (uid, name or "", int(time.time())))
                 # بذر شروع
-                c.execute("""INSERT INTO garden_seeds(user_id, seed_type, qty) VALUES (?, 'کلمو', 1)
-                             ON CONFLICT(user_id, seed_type) DO UPDATE SET qty=qty+1""", (uid,))
+                c.execute("""INSERT INTO garden_seeds(user_id, seed_type, qty) VALUES (%s, 'کلمو', 1)
+                             ON CONFLICT(user_id, seed_type)
+                             DO UPDATE SET qty = garden_seeds.qty + 1""", (uid,))
             elif name:
-                c.execute("UPDATE garden_players SET name=? WHERE user_id=?", (name, uid))
+                c.execute("UPDATE garden_players SET name=%s WHERE user_id=%s", (name, uid))
 
     # ---- growth / seeds ----
     def add_growth(self, uid, amount, source="", detail=""):
         self.ensure_starter(uid)
         with self._conn() as c:
-            tree = c.execute("SELECT growth FROM garden_trees WHERE user_id=?", (uid,)).fetchone()
+            tree = c.execute("SELECT growth FROM garden_trees WHERE user_id=%s", (uid,)).fetchone()
             if not tree:
                 return  # درختی کاشته نشده
             new_growth = min(HARVEST_AT, int(tree["growth"]) + int(amount))
             grew = new_growth - int(tree["growth"])
             # هر واحد رشد → سکه/xp در انتظار برداشت
             c.execute("""UPDATE garden_trees
-                         SET growth=?, pending_coins=pending_coins+?, pending_xp=pending_xp+?
-                         WHERE user_id=?""",
+                         SET growth=%s, pending_coins=pending_coins+%s, pending_xp=pending_xp+%s
+                         WHERE user_id=%s""",
                       (new_growth, grew * 2, grew, uid))
 
     def add_seed(self, uid, seed_type=None, qty=1, source=""):
         self.ensure_starter(uid)
         st = seed_type or random_seed_type()
         with self._conn() as c:
-            c.execute("""INSERT INTO garden_seeds(user_id, seed_type, qty) VALUES (?,?,?)
-                         ON CONFLICT(user_id, seed_type) DO UPDATE SET qty=qty+?""",
+            c.execute("""INSERT INTO garden_seeds(user_id, seed_type, qty) VALUES (%s,%s,%s)
+                         ON CONFLICT(user_id, seed_type)
+                         DO UPDATE SET qty = garden_seeds.qty + %s""",
                       (uid, st, qty, qty))
         return st
 
@@ -1145,10 +1241,10 @@ class GardenAPI:
         self.ensure_starter(uid)
         today = _today()
         with self._conn() as c:
-            row = c.execute("SELECT last_visit FROM garden_players WHERE user_id=?", (uid,)).fetchone()
+            row = c.execute("SELECT last_visit FROM garden_players WHERE user_id=%s", (uid,)).fetchone()
             if row and row["last_visit"] == today:
                 return False
-            c.execute("UPDATE garden_players SET last_visit=? WHERE user_id=?", (today, uid))
+            c.execute("UPDATE garden_players SET last_visit=%s WHERE user_id=%s", (today, uid))
         self.add_growth(uid, 5, source="daily_visit")
         return True
 
@@ -1157,25 +1253,25 @@ class GardenAPI:
         self.ensure_starter(uid)
         with self._conn() as c:
             rows = c.execute("""SELECT seed_type, qty FROM garden_seeds
-                                WHERE user_id=? AND qty>0 ORDER BY seed_type""", (uid,)).fetchall()
+                                WHERE user_id=%s AND qty>0 ORDER BY seed_type""", (uid,)).fetchall()
         return [dict(r) for r in rows]
 
     def plant_seed(self, uid, seed_type):
         self.ensure_starter(uid)
         with self._conn() as c:
-            existing = c.execute("SELECT growth FROM garden_trees WHERE user_id=?", (uid,)).fetchone()
+            existing = c.execute("SELECT growth FROM garden_trees WHERE user_id=%s", (uid,)).fetchone()
             if existing and int(existing["growth"]) < HARVEST_AT:
                 return False, "یه درخت در حال رشد داری. اول برداشتش کن."
-            seed = c.execute("SELECT qty FROM garden_seeds WHERE user_id=? AND seed_type=?",
+            seed = c.execute("SELECT qty FROM garden_seeds WHERE user_id=%s AND seed_type=%s",
                              (uid, seed_type)).fetchone()
             if not seed or int(seed["qty"]) <= 0:
                 return False, "این بذر رو نداری."
-            c.execute("UPDATE garden_seeds SET qty=qty-1 WHERE user_id=? AND seed_type=?",
+            c.execute("UPDATE garden_seeds SET qty=qty-1 WHERE user_id=%s AND seed_type=%s",
                       (uid, seed_type))
             rarity = RARITY_BY_SEED.get(seed_type, "normal")
             c.execute("""INSERT INTO garden_trees(user_id, seed_type, rarity, growth,
                          pending_coins, pending_xp, pending_boxes, planted_at)
-                         VALUES (?,?,?,0,0,0,0,?)
+                         VALUES (%s,%s,%s,0,0,0,0,%s)
                          ON CONFLICT(user_id) DO UPDATE SET
                             seed_type=excluded.seed_type, rarity=excluded.rarity,
                             growth=0, pending_coins=0, pending_xp=0, pending_boxes=0,
@@ -1186,7 +1282,7 @@ class GardenAPI:
     def harvest(self, uid):
         self.ensure_starter(uid)
         with self._conn() as c:
-            tree = c.execute("SELECT * FROM garden_trees WHERE user_id=?", (uid,)).fetchone()
+            tree = c.execute("SELECT * FROM garden_trees WHERE user_id=%s", (uid,)).fetchone()
             if not tree:
                 return False, "درختی برای برداشت نداری.", None
             if int(tree["growth"]) < HARVEST_AT:
@@ -1195,20 +1291,21 @@ class GardenAPI:
             xp = int(tree["pending_xp"])
             boxes = int(tree["pending_boxes"])
             # جایزه به بازیکن اصلی (جدول players هسته)
-            p = c.execute("SELECT level, xp, coins FROM players WHERE user_id=?", (uid,)).fetchone()
+            p = c.execute("SELECT level, xp, coins FROM players WHERE user_id=%s", (uid,)).fetchone()
             if p:
                 from core.progression import add_xp
                 nl, nx, _ = add_xp(p["level"], p["xp"], xp)
-                c.execute("UPDATE players SET coins=?, level=?, xp=? WHERE user_id=?",
+                c.execute("UPDATE players SET coins=%s, level=%s, xp=%s WHERE user_id=%s",
                           (p["coins"] + coins, nl, nx, uid))
             # درخت برداشت شد → پاک
-            c.execute("DELETE FROM garden_trees WHERE user_id=?", (uid,))
+            c.execute("DELETE FROM garden_trees WHERE user_id=%s", (uid,))
             # شانس بذر جایزه
             reward_seed = None
             if random.random() < 0.4:
                 reward_seed = random_seed_type()
-                c.execute("""INSERT INTO garden_seeds(user_id, seed_type, qty) VALUES (?,?,1)
-                             ON CONFLICT(user_id, seed_type) DO UPDATE SET qty=qty+1""",
+                c.execute("""INSERT INTO garden_seeds(user_id, seed_type, qty) VALUES (%s,%s,1)
+                             ON CONFLICT(user_id, seed_type)
+                             DO UPDATE SET qty = garden_seeds.qty + 1""",
                           (uid, reward_seed))
         return True, "برداشت شد!", {"coins": coins, "xp": xp, "boxes": boxes, "seed": reward_seed}
 
@@ -1217,7 +1314,7 @@ class GardenAPI:
         self.ensure_starter(uid)
         today = _today()
         with self._conn() as c:
-            row = c.execute("SELECT water_day, water_used FROM garden_players WHERE user_id=?",
+            row = c.execute("SELECT water_day, water_used FROM garden_players WHERE user_id=%s",
                             (uid,)).fetchone()
             if not row or row["water_day"] != today:
                 return DAILY_WATER_QUOTA
@@ -1230,15 +1327,15 @@ class GardenAPI:
         self.ensure_starter(target_id)
         today = _today()
         with self._conn() as c:
-            row = c.execute("SELECT water_day, water_used FROM garden_players WHERE user_id=?",
+            row = c.execute("SELECT water_day, water_used FROM garden_players WHERE user_id=%s",
                             (uid,)).fetchone()
             used = int(row["water_used"]) if row and row["water_day"] == today else 0
             if used >= DAILY_WATER_QUOTA:
                 return False, "سهمیه‌ی آبیاری امروزت تموم شده."
-            tree = c.execute("SELECT growth FROM garden_trees WHERE user_id=?", (target_id,)).fetchone()
+            tree = c.execute("SELECT growth FROM garden_trees WHERE user_id=%s", (target_id,)).fetchone()
             if not tree:
                 return False, "این باغ درختی نداره."
-            c.execute("UPDATE garden_players SET water_day=?, water_used=? WHERE user_id=?",
+            c.execute("UPDATE garden_players SET water_day=%s, water_used=%s WHERE user_id=%s",
                       (today, used + 1, uid))
         self.add_growth(target_id, 3, source="friend_water")
         return True, "آبیاری شد 💧 (+۳٪ رشد)"
@@ -1247,9 +1344,9 @@ class GardenAPI:
     def public(self, uid):
         self.ensure_starter(uid)
         with self._conn() as c:
-            gp = c.execute("SELECT name FROM garden_players WHERE user_id=?", (uid,)).fetchone()
-            tree = c.execute("SELECT * FROM garden_trees WHERE user_id=?", (uid,)).fetchone()
-            seeds = c.execute("SELECT seed_type, qty FROM garden_seeds WHERE user_id=? AND qty>0",
+            gp = c.execute("SELECT name FROM garden_players WHERE user_id=%s", (uid,)).fetchone()
+            tree = c.execute("SELECT * FROM garden_trees WHERE user_id=%s", (uid,)).fetchone()
+            seeds = c.execute("SELECT seed_type, qty FROM garden_seeds WHERE user_id=%s AND qty>0",
                               (uid,)).fetchall()
         return {
             "name": (gp["name"] if gp and gp["name"] else f"کاربر {uid}"),
@@ -1266,10 +1363,11 @@ class GardenAPI:
                 FROM garden_trees t
                 LEFT JOIN players p ON p.user_id = t.user_id
                 LEFT JOIN garden_players gp ON gp.user_id = t.user_id
-                WHERE t.user_id <> ?
+                WHERE t.user_id <> %s
                 ORDER BY t.growth DESC
-                LIMIT ?""", (uid, limit)).fetchall()
+                LIMIT %s""", (uid, limit)).fetchall()
         return [dict(r) for r in rows]
+
 ```
 
 
@@ -1525,12 +1623,23 @@ FILE: features\lucky_box.py
 
 ```py
 # -*- coding: utf-8 -*-
-"""Lucky Box بعد از پایان مسابقه."""
+"""🎁 جعبه شانس بعد از پایان مسابقه.
 
+Phase 1: احتمال ظاهر شدن به‌طور محسوس کاهش یافت (۰٫۲۵ → ۰٫۱۰) و نام در همه‌جا
+از «Lucky Box» به «🎁 جعبه شانس» تغییر کرد.
+"""
+
+import logging
 import random
 from core import db, progression as pr
 
-DROP_CHANCE = 0.25
+logger = logging.getLogger("kalemo.luckybox")
+
+# نام نمایشی واحد برای استفاده در UI/پیام‌ها/لاگ‌ها.
+BOX_NAME = "🎁 جعبه شانس"
+
+# احتمال ظاهر شدن جعبه شانس بعد از هر مسابقه (به‌ازای هر بازیکن).
+DROP_CHANCE = 0.10
 
 ITEMS = [
     {"type": "coin", "value": 30, "rarity": "common", "weight": 40},
@@ -1550,33 +1659,38 @@ def _pick_item():
 
 
 def try_grant(uid, match_id=None):
-    if random.random() > DROP_CHANCE:
+    """با احتمال DROP_CHANCE یک جعبه شانس به بازیکن می‌دهد.
+
+    خطاها لاگ می‌شوند و None برمی‌گردد تا هرگز جریان پایان بازی را نشکنند.
+    """
+    try:
+        if random.random() > DROP_CHANCE:
+            return None
+
+        item = _pick_item()
+        p = db.get_player(uid)
+        if not p:
+            return None
+
+        if item["type"] == "coin":
+            db.save_player(uid, coins=p["coins"] + int(item["value"]))
+        elif item["type"] == "xp":
+            lvl, xp, _ = pr.add_xp(p["level"], p["xp"], int(item["value"]))
+            db.save_player(uid, level=lvl, xp=xp)
+
+        # title/badge/profile_frame/seed فعلاً فقط در جدول ذخیره می‌شوند.
+        db.add_lucky_box(
+            user_id=uid,
+            match_id=match_id,
+            item_type=item["type"],
+            item_value=item["value"],
+            rarity=item["rarity"],
+        )
+        logger.info("جعبه شانس به کاربر %s داده شد: %s", uid, item)
+        return item
+    except Exception:
+        logger.exception("خطا در اعطای جعبه شانس به کاربر %s", uid)
         return None
-
-    item = _pick_item()
-    p = db.get_player(uid)
-
-    if not p:
-        return None
-
-    if item["type"] == "coin":
-        db.save_player(uid, coins=p["coins"] + int(item["value"]))
-
-    elif item["type"] == "xp":
-        lvl, xp, _ = pr.add_xp(p["level"], p["xp"], int(item["value"]))
-        db.save_player(uid, level=lvl, xp=xp)
-
-    # title, badge, profile_frame, seed فعلاً فقط در lucky_boxes ذخیره می‌شوند
-    # (برای استفاده در سیستم‌های آینده مثل پروفایل/باغچه).
-    db.add_lucky_box(
-        user_id=uid,
-        match_id=match_id,
-        item_type=item["type"],
-        item_value=item["value"],
-        rarity=item["rarity"]
-    )
-
-    return item
 
 
 def item_text(item):
@@ -1954,6 +2068,14 @@ FILE: game\modes\blank.py
 """مود جای خالی (Enhanced Missing Letters).
 حذف هوشمند حروف با سختی پویا و جلوگیری از الگوی تکراری.
 نمونه‌ها: س-ب → سیب | در-ت → درخت | ک-امی-ن → کامیون
+
+نسخه‌ی Phase 1 (Beta) — رفع باگ‌ها:
+- باگ فریز/کرش: در نسخه‌ی قبلی `pool` فقط وقتی ساخته می‌شد که لیست کلمات
+  «خالی» بود؛ در نتیجه با وجود کلمه، `pool` تعریف‌نشده می‌ماند و
+  `NameError` رخ می‌داد (استثنای خاموش → فریز بازی). حالا `pool` همیشه
+  به‌درستی ساخته می‌شود.
+- حذف کد تکراری انتخاب کلمه (قبلاً منطق انتخاب دوبار کپی شده بود).
+- حلقه‌ی ضدتکرار محدود است (bounded) تا هرگز بی‌نهایت نشود.
 """
 import random
 from .base import BaseMode
@@ -1974,7 +2096,7 @@ class BlankMode(BaseMode):
     def __init__(self, words, ruleset=None, difficulty="normal", **kw):
         super().__init__(words, ruleset)
         self.difficulty = difficulty if difficulty in DIFFICULTY else "normal"
-        self._recent = []  # الگوهای اخیر برای ضدتکرار
+        self._recent = []  # کلمات اخیر برای ضدتکرار
 
     def tutorial(self):
         names = {"easy": "آسان", "normal": "معمولی", "hard": "سخت"}
@@ -1995,11 +2117,12 @@ class BlankMode(BaseMode):
             ratio = DIFFICULTY[self.difficulty]
             hide_count = max(1, min(n - 1, round(n * ratio)))
         positions = random.sample(range(n), k=hide_count)
-        out = []
         hidden = set(positions)
+        out = []
         i = 0
         while i < n:
             if i in hidden:
+                # چند حرف پشت‌سرهمِ حذف‌شده را با یک خط تیره نشان بده
                 while i < n and i in hidden:
                     i += 1
                 out.append(DASH)
@@ -2009,23 +2132,21 @@ class BlankMode(BaseMode):
         return "".join(out)
 
     def new_question(self):
-        if not self.words:
-            pool = [w for w in self.words if (w or "").strip()]
+        # pool همیشه از کلمات معتبر ساخته می‌شود (رفع باگ NameError).
+        pool = [w for w in self.words if (w or "").strip()]
         if not pool:
-            return {"prompt": "کلمه‌ای ثبت نشده 😅", "answer": None}
+            return {"prompt": "کلمه‌ای برای این دسته ثبت نشده 😅", "answer": None}
+
+        # ضدتکرار: تا چند تلاش، کلمه‌ای متفاوت از اخیرها انتخاب کن (حلقه‌ی محدود).
         word = random.choice(pool)
         for _ in range(8):
             if word not in self._recent:
                 break
             word = random.choice(pool)
-        # ضدتکرار: تا چند تلاش کلمه‌ای متفاوت از اخیرها انتخاب کن
-        word = random.choice(pool)
-        for _ in range(8):
-            if word not in self._recent:
-                break
-            word = random.choice(pool)
+
         masked = self._mask_word(word)
-        # اطمینان از این‌که الگو با دفعه قبل یکی نباشد
+        # اگر کلمه فقط یک حرف مؤثر داشت، ماسک ممکن است کل کلمه را نشان دهد؛
+        # در آن صورت هم مشکلی نیست چون بازیکن باید همان کلمه را بفرستد.
         self._recent = (self._recent + [word])[-5:]
         return {
             "prompt": f"🧩 کلمه رو کامل کن:\n\n<code>{masked}</code>",
@@ -2039,6 +2160,7 @@ class BlankMode(BaseMode):
         if self.norm(text) == self.norm(ans):
             return True, None
         return False, "غلط"
+
 ```
 
 
@@ -2483,6 +2605,86 @@ class VariableMode(BaseMode):
 
 
 ================================================================================
+FILE: game\ranking.py
+================================================================================
+
+```py
+# -*- coding: utf-8 -*-
+"""رتبه‌بندی مرکزی و واحد کلمو (Single Source of Truth).
+
+هدف: حذف منطق تکراریِ مرتب‌سازی که در چند جا پراکنده بود و باعث باگ رتبه‌بندی
+(نمایش بازیکن با امتیاز صفر بالاتر از بازیکن با امتیاز بیشتر) می‌شد.
+
+قوانین مرتب‌سازی قطعی (deterministic tie-break):
+1. امتیاز بیشتر (score) — نزولی
+2. برد بیشتر (wins) — نزولی
+3. ثبت‌نام زودتر / user_id کوچک‌تر — صعودی
+
+هر جای پروژه که رتبه‌بندی می‌خواهد، فقط از این ماژول استفاده می‌کند.
+"""
+
+
+def rank_key(score=0, wins=0, uid=0):
+    """کلید مرتب‌سازی قطعی. با sort(key=..., reverse=True) استفاده نکنید؛
+    این کلید طوری ساخته شده که خودش «هرچه بزرگ‌تر = رتبه بهتر» را رعایت کند
+    و user_id کوچک‌تر (ثبت زودتر) در تساوی برنده باشد.
+    """
+    # user_id را منفی می‌کنیم تا در حالت نزولی، uid کوچک‌تر بالاتر بیاید.
+    return (int(score or 0), int(wins or 0), -int(uid or 0))
+
+
+def sort_players(players):
+    """players: dict یا list از (uid, info) که info شامل score و اختیاری wins است.
+
+    خروجی: list مرتب‌شده‌ی (uid, info) به‌صورت نزولی و قطعی.
+    """
+    items = players.items() if isinstance(players, dict) else list(players)
+    return sorted(
+        items,
+        key=lambda kv: rank_key(
+            score=kv[1].get("score", 0),
+            wins=kv[1].get("wins", 0),
+            uid=kv[0],
+        ),
+        reverse=True,
+    )
+
+
+def sort_rows(rows, score_getter, wins_getter=None, id_getter=None):
+    """مرتب‌سازی عمومی برای ردیف‌های دلخواه (مثلاً خروجی SQL).
+
+    rows: iterable
+    score_getter/wins_getter/id_getter: توابعی که از هر ردیف مقدار را می‌گیرند.
+    """
+    def key(r):
+        return rank_key(
+            score=score_getter(r),
+            wins=wins_getter(r) if wins_getter else 0,
+            uid=id_getter(r) if id_getter else 0,
+        )
+    return sorted(rows, key=key, reverse=True)
+
+
+def assert_sorted(ranked, score_getter):
+    """اعتبارسنجی خودکار: مطمئن می‌شود لیست واقعاً نزولی مرتب شده است.
+
+    اگر جایی امتیاز پایین‌تر بالاتر از امتیاز بالاتر باشد، AssertionError می‌دهد.
+    این تابع قبل از ارسال هر لیدربورد صدا زده می‌شود تا باگ رتبه هرگز به کاربر نرسد.
+    """
+    prev = None
+    for i, item in enumerate(ranked):
+        cur = int(score_getter(item) or 0)
+        if prev is not None and cur > prev:
+            raise AssertionError(
+                f"Leaderboard not sorted: index {i} score {cur} > previous {prev}"
+            )
+        prev = cur
+    return True
+
+```
+
+
+================================================================================
 FILE: game\rules.py
 ================================================================================
 
@@ -2637,11 +2839,15 @@ FILE: game\session.py
 """Game Session مستقل + Join System + تنظیمات لابی + سیستم زمان.
 وضعیت هر گروه در حافظه نگه‌داری می‌شود (یک بازی فعال در هر گروه).
 حالت‌ها: lobby -> countdown -> tutorial -> running -> ended
+
+نسخه‌ی Phase 1 (Beta): اصلاحات پایداری تایمر، ضدتکرار سوال، قفل پایان،
+و رتبه‌بندی قطعی از طریق game.ranking.
 """
 import time
 from game.rules import RuleSet
 from game.modes import get_mode_class, mode_meta
 from core.normalize import normalize_word
+from game import ranking
 
 # گزینه‌های زمان مسابقه (ثانیه) — 0 یعنی نامحدود
 TIME_OPTIONS = [
@@ -2657,6 +2863,10 @@ DIFFICULTY_OPTIONS = [
     ("normal", "معمولی"),
     ("hard",   "سخت"),
 ]
+
+# مودهایی که «رد کردن خودکار پس از بی‌پاسخی» ندارند.
+NO_AUTOSKIP_MODES = {"classic_random", "classic_choice", "namefamily"}
+AUTOSKIP_SECONDS = 20
 
 
 def time_label(seconds):
@@ -2686,7 +2896,7 @@ class Session:
         self.words = []
         self.mode = None
         self.question = None
-        self.used = set()
+        self.used = set()                  # کلمات پذیرفته‌شده‌ی همین دور (ضدتکرار پاسخ)
         self.focus_mode = False
         self.panel_msg_id = None
         # ---- سیستم زمان ----
@@ -2695,22 +2905,28 @@ class Session:
         self.deadline = None
         # ---- سختی (برای جای خالی) ----
         self.difficulty = "normal"
-        # ---- وظیفه زمان‌بندی اتمام خودکار ----
+        # ---- وظیفه زمان‌بندی اتمام خودکار + وظیفه استاتوس دوره‌ای ----
         self.timer_task = None
+        self.status_task = None
         # ---- شناسه پیام زنده‌ی بازی ----
         self.live_msg_id = None
         self.correct_total = 0
         self.wrong_total = 0
         self.correct_by_user = {}
         self.wrong_by_user = {}
-        self.warns = {}
-        self.warns = {}   # uid -> تعداد اخطار در همین بازی
+        self.warns = {}                    # uid -> تعداد اخطار در همین بازی
+        # ---- قفل پایان: جلوگیری از رویداد پایان تکراری (race condition) ----
+        self.finishing = False
+        # ---- تاریخچه‌ی سوالات: هر سوال فقط یک‌بار تا اتمام همه ----
+        self.question_history = set()
+        # ---- زمان آخرین فعالیت پاسخ (برای autoskip) ----
+        self.last_answer_at = None
 
     def add_warn(self, uid):
         """یک اخطار اضافه می‌کند و تعداد کل اخطارهای کاربر را برمی‌گرداند."""
         self.warns[uid] = self.warns.get(uid, 0) + 1
         return self.warns[uid]
-    
+
     # ---- Join System ----
     def join(self, uid, name):
         if self.state != "lobby":
@@ -2741,6 +2957,7 @@ class Session:
         self.mode = None
         self.question = None
         self.used = set()
+        self.question_history = set()
         self.ruleset.rules = []
         return True
 
@@ -2750,6 +2967,10 @@ class Session:
     def is_round_based(self):
         """مودهایی که به‌جای سوال پیاپی، یک دور جمعی دارند (مثل اسم‌وفامیل)."""
         return self.mode_id == "namefamily"
+
+    def autoskip_enabled(self):
+        """آیا این مود پس از ۲۰ثانیه بی‌پاسخی باید خودکار رد شود؟"""
+        return self.mode_id not in NO_AUTOSKIP_MODES
 
     def build_mode(self):
         cls = get_mode_class(self.mode_id)
@@ -2762,22 +2983,47 @@ class Session:
         return self.mode
 
     # ---- gameplay ----
+    def _question_signature(self, q):
+        """امضای یکتا برای یک سوال، جهت جلوگیری از تکرار در یک مسابقه."""
+        if not isinstance(q, dict):
+            return str(q)
+        # از prompt به‌عنوان امضا استفاده می‌کنیم (در همه‌ی مودها یکتا و پایدار است).
+        return q.get("prompt") or repr(sorted(q.get("answers", [])))
+
     def next_question(self):
-        self.question = self.mode.new_question()
-        return self.question
+        """سوال بعدی را می‌سازد و از تکرار در همین مسابقه جلوگیری می‌کند.
+
+        باگ قبلی: بعضی مودها ممکن بود سوال تکراری تولید کنند یا در تلاش برای
+        اجتناب از تکرار وارد حلقه‌ی بی‌نهایت شوند. اینجا سقف تلاش (bounded loop)
+        گذاشته شده تا هرگز فریز نشود؛ اگر همه‌ی سوالات تمام شدند، تاریخچه ریست
+        می‌شود تا بازی ادامه یابد.
+        """
+        MAX_TRIES = 12
+        q = None
+        for _ in range(MAX_TRIES):
+            q = self.mode.new_question()
+            sig = self._question_signature(q)
+            if sig not in self.question_history:
+                self.question_history.add(sig)
+                self.question = q
+                return q
+        # همه‌ی سوالات (تا این‌جا) دیده شده‌اند → تاریخچه را پاک کن و ادامه بده.
+        self.question_history.clear()
+        if q is not None:
+            self.question_history.add(self._question_signature(q))
+        self.question = q
+        return q
 
     def submit(self, uid, name, text):
         if self.state != "running" or not self.question:
             return None
-        from core.normalize import normalize_word
         w = text.strip()
         nw = normalize_word(w)
         if uid not in self.players:
             self.players[uid] = {"name": name, "score": 0}
         if nw in self.used:
-            self.wrong_total += 1
-            self.wrong_by_user[uid] = self.wrong_by_user.get(uid, 0) + 1
-            return {"ok": False, "reason": "تکراری"}
+            # کلمه‌ی تکراری در همین دور — بدون کسر امتیاز، فقط علامت‌گذاری می‌شود.
+            return {"ok": False, "reason": "duplicate"}
         ok, reason = self.mode.check_answer(self.question, w)
         if not ok:
             self.wrong_total += 1
@@ -2786,6 +3032,7 @@ class Session:
         self.used.add(nw)
         self.correct_total += 1
         self.correct_by_user[uid] = self.correct_by_user.get(uid, 0) + 1
+        self.last_answer_at = time.time()
         pts = 10
         if self.ruleset.is_active("bonus"):
             pts += 5
@@ -2795,9 +3042,9 @@ class Session:
             "points": pts,
             "score": self.players[uid]["score"],
             "found": len(self.used),
-            "total": len({normalize_word(w) for w in self.words})
+            "total": len({normalize_word(x) for x in self.words})
         }
-    
+
     def progress(self):
         total = len({
             normalize_word(w)
@@ -2807,20 +3054,14 @@ class Session:
         found = len(self.used)
         return found, total
 
-
     def is_completed(self):
         found, total = self.progress()
         return total > 0 and found >= total
 
-
-    def add_warn(self, uid):
-        self.warns[uid] = self.warns.get(uid, 0) + 1
-        return self.warns[uid]
-
-
     # ---- زمان ----
     def start_timer(self):
         self.started_at = time.time()
+        self.last_answer_at = self.started_at
         if self.time_limit > 0:
             self.deadline = self.started_at + self.time_limit
         else:
@@ -2845,7 +3086,12 @@ class Session:
         return None
 
     def ranking(self):
-        return sorted(self.players.items(), key=lambda kv: kv[1]["score"], reverse=True)
+        """رتبه‌بندی قطعی از طریق game.ranking (منبع واحد حقیقت).
+
+        باگ قبلی: مرتب‌سازی صرفاً بر اساس score بود و در تساوی نتیجه‌ی
+        غیرقطعی می‌داد. حالا tie-break با user_id قطعی است.
+        """
+        return ranking.sort_players(self.players)
 
 
 # ---- رجیستری session‌های فعال ----
@@ -2867,12 +3113,15 @@ def create(chat_id, host_id, host_name, mode_id="classic_random"):
     return s
 
 def remove(chat_id):
+    """session را حذف می‌کند و همه‌ی taskهای پس‌زمینه را امن لغو می‌کند."""
     s = _sessions.pop(chat_id, None)
-    if s and s.timer_task:
-        try:
-            s.timer_task.cancel()
-        except Exception:
-            pass
+    if s:
+        for task in (s.timer_task, s.status_task):
+            if task:
+                try:
+                    task.cancel()
+                except Exception:
+                    pass
     return s
 
 ```
@@ -3553,11 +3802,27 @@ FILE: handlers\lobby.py
 همه با EditMessage.
 
 اسم‌وفامیل: پاسخ‌ها فقط در PV ثبت می‌شوند (handlers/namefamily_private.py).
-پایان مسابقه: گزارش مسابقه ثبت می‌شود و احتمال Lucky Box برای بازیکنان بررسی می‌شود.
+پایان مسابقه: گزارش مسابقه ثبت می‌شود و احتمال «🎁 جعبه شانس» بررسی می‌شود.
+
+نسخه‌ی Phase 1 (Beta) — رفع باگ‌ها:
+- تایمر روی صفر فریز نمی‌شود (remaining هرگز منفی نیست) و در پایان زمان،
+  بازی به‌طور قطعی تمام می‌شود.
+- auto-skip: در مودهای سوال‌محور (به‌جز کلاسیک و اسم‌وفامیل) اگر ۲۰ ثانیه
+  هیچ پاسخ درستی نیاید، سوال به‌طور خودکار رد و سوال بعدی نمایش داده می‌شود.
+- پیام وضعیت دوره‌ای هر ۳۰ ثانیه (status_task) برای زنده نگه‌داشتن مسابقه.
+- خطاهای تسک‌های پس‌زمینه دیگر خاموش نیستند و لاگ می‌شوند.
+- قفل پایان (s.finishing) از اجرای دوباره‌ی پایان (race condition) جلوگیری می‌کند.
+- سازگاری با session.submit جدید (کلیدهای points/found/total) و پاسخ تکراری.
+- «Lucky Box» → «🎁 جعبه شانس».
 """
 import asyncio
+import html
+import logging
 import re
-from telegram import Update
+import time
+from datetime import timedelta
+
+from telegram import Update, ChatPermissions
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
@@ -3565,24 +3830,23 @@ from core import db
 from features import player_service as svc
 from game import session as sess
 from ui import panels, persona
-import html
-import time
 
 HTML = ParseMode.HTML
-
-import time
-from datetime import timedelta
-from telegram import ChatPermissions
+log = logging.getLogger(__name__)
 
 MAX_WARNS = 3                 # سقف اخطار قبل از سکوت
 MUTE_SECONDS = 5 * 60         # مدت سکوت: ۵ دقیقه
 FOCUS_WORD_LIMIT = 3          # بیش از این تعداد کلمه = پیام جمله‌ای
+STATUS_INTERVAL = 30          # فاصله‌ی پیام وضعیت دوره‌ای (ثانیه)
+LIVE_REFRESH = 10            # فاصله‌ی رفرش پیام زنده (ثانیه)
+
 
 def _arg(parts, i):
     try:
         return parts[i]
     except IndexError:
         return None
+
 
 # عبارت‌های متنی که بازی را شروع می‌کنند (بدون اسلش)
 START_PATTERNS = [r"^شروع\s+کلمو$", r"^شروع\s+بازی$", r"^کلمو$"]
@@ -3650,6 +3914,7 @@ async def cmd_endgame(update, ctx):
             "⛔️ فقط سازنده‌ی بازی یا ادمین‌های گروه می‌تونن بازی رو تموم کنن.")
     await _finish(ctx, chat.id)
 
+
 async def cmd_settings(update, ctx):
     chat = update.effective_chat
     if chat.type == "private":
@@ -3686,10 +3951,7 @@ async def _safe_delete(msg):
 
 
 async def _warn_and_maybe_mute(ctx, s, chat_id, u, reason_text):
-    """
-    یک اخطار ثبت می‌کند؛ در اخطار سوم کاربر را ۵ دقیقه سکوت می‌کند.
-    یک پیام کوتاه (خوداتخریب) در گروه می‌فرستد.
-    """
+    """یک اخطار ثبت می‌کند؛ در اخطار سوم کاربر را ۵ دقیقه سکوت می‌کند."""
     n = s.add_warn(u.id)
     name = u.first_name or "کاربر"
 
@@ -3704,7 +3966,6 @@ async def _warn_and_maybe_mute(ctx, s, chat_id, u, reason_text):
             muted = True
         except Exception:
             muted = False
-        # اخطارها را برای شروع دوباره صفر کن تا بعد از سکوت از نو شمرده شود
         s.warns[u.id] = 0
         if muted:
             txt = (f"🔇 <a href=\"tg://user?id={u.id}\">{name}</a> "
@@ -3719,22 +3980,23 @@ async def _warn_and_maybe_mute(ctx, s, chat_id, u, reason_text):
 
     try:
         note = await ctx.bot.send_message(chat_id, txt, parse_mode=HTML)
-        # پیام هشدار را بعد از ۵ ثانیه پاک کن تا گروه شلوغ نشود
         ctx.job_queue.run_once(
             lambda c: c.bot.delete_message(chat_id, note.message_id),
             5, name=f"delwarn:{chat_id}:{note.message_id}")
     except Exception:
-        pass
+        log.exception("ارسال/زمان‌بندی حذف پیام اخطار شکست خورد")
+
 
 # ---------- بررسی دسترسی سازنده ----------
 def _host_only(s, uid):
     return uid == s.host_id
 
 
-
 HOST_ACTIONS = {"mode", "setmode", "rules", "toggle", "time", "settime",
                 "diff", "setdiff", "cat", "catpage", "setcat",
                 "start", "cancel", "focus", "end"}
+
+
 # ---------- callbackها ----------
 async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -3777,36 +4039,28 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await q.answer("مود نامعتبر است.", show_alert=True)
         await q.answer(f"مود شد: {s.mode_name()}")
         return await _refresh_lobby(q, s)
-    
+
     if action == "cat":
         cats = db.list_categories()
         await q.answer()
         return await q.message.edit_text(
-            panels.category_text(),
-            parse_mode=HTML,
-            reply_markup=panels.category_kb(cats, s.category),
-        )
+            panels.category_text(), parse_mode=HTML,
+            reply_markup=panels.category_kb(cats, s.category))
 
     if action == "catpage":
         page = int(_arg(parts, 2) or 0)
         cats = db.list_categories()
         await q.answer()
         return await q.message.edit_text(
-            panels.category_text(),
-            parse_mode=HTML,
-            reply_markup=panels.category_kb(cats, s.category, page=page),
-        )    
+            panels.category_text(), parse_mode=HTML,
+            reply_markup=panels.category_kb(cats, s.category, page=page))
 
     if action == "setcat":
-        page = int(_arg(parts, 2) or 0)
         cat = ":".join(parts[3:]).strip()
-
         if not cat or not db.get_category(cat):
             return await q.answer("دسته نامعتبر است.", show_alert=True)
-
         s.category = cat
         s.words = db.list_words(cat) or []
-
         await q.answer("دسته انتخاب شد.")
         return await _refresh_lobby(q, s)
 
@@ -3850,7 +4104,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s.ruleset.toggle(rid)
         await q.answer()
         return await q.message.edit_text(panels.rules_text(), parse_mode=HTML,
-                                        reply_markup=panels.rules_kb(s))
+                                         reply_markup=panels.rules_kb(s))
 
     if action == "focus":
         s.focus_mode = not s.focus_mode
@@ -3871,10 +4125,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if s.count() < 2:
             return await q.answer("حداقل دو بازیکن برای شروع لازم است.", show_alert=True)
         if not _load_category_for_session(s):
-            return await q.answer(
-                "برای این مود دسته/کلمه کافی نیست.",
-                show_alert=True,
-            )
+            return await q.answer("برای این مود دسته/کلمه کافی نیست.", show_alert=True)
         await q.answer()
         return await _start_countdown(q, ctx, s)
 
@@ -3884,6 +4135,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "فقط سازنده یا ادمین گروه می‌تونه پایان بده.", show_alert=True)
         await q.answer()
         return await _finish(ctx, chat_id)
+
 
 async def _refresh_lobby(q, s):
     try:
@@ -3902,10 +4154,7 @@ async def _start_countdown(q, ctx, s):
     if mentions:
         try:
             await ctx.bot.send_message(
-                s.chat_id,
-                "شروع مسابقه:\n" + mentions,
-                parse_mode=HTML,
-            )
+                s.chat_id, "شروع مسابقه:\n" + mentions, parse_mode=HTML)
         except Exception:
             pass
     s.live_msg_id = msg.message_id
@@ -3941,15 +4190,18 @@ async def _start_countdown(q, ctx, s):
         from handlers import namefamily_private as nf
         await nf.start_group_namefamily(ctx, s)
 
-    # زمان‌بند اتمام خودکار + رفرش زنده
+    # زمان‌بند اتمام خودکار/auto-skip + پیام وضعیت دوره‌ای
     s.timer_task = asyncio.create_task(_run_loop(ctx, s))
+    s.status_task = asyncio.create_task(_status_loop(ctx, s))
 
 
 async def _run_loop(ctx, s):
-    """تا پایان زمان، پیام زنده را به‌روزرسانی می‌کند و سپس بازی را تمام می‌کند.
+    """حلقه‌ی اصلی بازی: هر ثانیه بررسی می‌کند.
 
-    برای اسم‌وفامیل هم تایمر قانون بازی ملاک است؛ کامل‌کردن فرم فقط یک شمارش
-    معکوس کوتاه‌تر ایجاد می‌کند، اما پایان بازی وابسته به تکمیل همه پاسخ‌ها نیست.
+    - اگر زمان تمام شد → بازی را تمام می‌کند (تایمر روی صفر فریز نمی‌شود).
+    - auto-skip: اگر مود واجد شرایط باشد و ۲۰ ثانیه هیچ پاسخ درستی نیاید،
+      سوال رد و سوال بعدی نمایش داده می‌شود.
+    - پیام زنده هر LIVE_REFRESH ثانیه به‌روزرسانی می‌شود.
     """
     try:
         while True:
@@ -3957,16 +4209,69 @@ async def _run_loop(ctx, s):
             cur = sess.get(s.chat_id)
             if not cur or cur is not s or s.state != "running":
                 return
+
             rem = s.remaining()
             if rem is not None and rem <= 0:
                 await _finish(ctx, s.chat_id, reason="time")
                 return
-            if rem is None or int(rem) % 10 == 0:
+
+            # auto-skip برای مودهای سوال‌محورِ واجد شرایط
+            if s.autoskip_enabled() and not s.is_round_based():
+                last = s.last_answer_at or s.started_at or time.time()
+                if time.time() - last >= sess.AUTOSKIP_SECONDS:
+                    await _autoskip(ctx, s)
+
+            # رفرش پیام زنده
+            if rem is None or int(rem) % LIVE_REFRESH == 0:
                 await _update_live(ctx, s)
     except asyncio.CancelledError:
         return
     except Exception:
+        log.exception("خطای غیرمنتظره در حلقه‌ی بازی (chat_id=%s)", s.chat_id)
+
+
+async def _autoskip(ctx, s):
+    """سوال فعلی را رد می‌کند و سوال بعدی را نمایش می‌دهد."""
+    try:
+        prev = s.question.get("prompt") if isinstance(s.question, dict) else None
+        s.next_question()
+        s.last_answer_at = time.time()   # تایمر auto-skip را ریست کن
+        # اگر واقعاً سوال عوض شد، اطلاع بده
+        cur = s.question.get("prompt") if isinstance(s.question, dict) else None
+        if cur != prev:
+            try:
+                await ctx.bot.send_message(
+                    s.chat_id, "⏭ کسی جواب نداد؛ سوال بعدی!", parse_mode=HTML)
+            except Exception:
+                pass
+        await _update_live(ctx, s)
+    except Exception:
+        log.exception("خطا در auto-skip (chat_id=%s)", s.chat_id)
+
+
+async def _status_loop(ctx, s):
+    """هر STATUS_INTERVAL ثانیه یک پیام وضعیت کوتاه در گروه می‌فرستد تا مسابقه
+    زنده و قابل‌دنبال‌کردن بماند (به‌ویژه در گروه‌های شلوغ)."""
+    try:
+        while True:
+            await asyncio.sleep(STATUS_INTERVAL)
+            cur = sess.get(s.chat_id)
+            if not cur or cur is not s or s.state != "running":
+                return
+            leader = s.leader()
+            leader_line = (f"🥇 صدرنشین: <b>{leader[0]}</b> — {leader[1]} امتیاز"
+                           if leader else "🥇 هنوز کسی امتیاز نگرفته")
+            try:
+                await ctx.bot.send_message(
+                    s.chat_id,
+                    f"⏱ باقی‌مانده: <b>{s.remaining_label()}</b>\n{leader_line}",
+                    parse_mode=HTML)
+            except Exception:
+                pass
+    except asyncio.CancelledError:
         return
+    except Exception:
+        log.exception("خطای غیرمنتظره در حلقه‌ی وضعیت (chat_id=%s)", s.chat_id)
 
 
 async def _update_live(ctx, s):
@@ -3978,11 +4283,18 @@ async def _update_live(ctx, s):
             text=panels.live_text(s), parse_mode=HTML,
             reply_markup=panels.running_kb(s))
     except Exception:
+        # خطای «message is not modified» عادی است؛ لاگ نمی‌کنیم.
         pass
 
 
 # ---------- پایان ----------
 async def _finish(ctx, chat_id, reason=None):
+    # قفل پایان: از اجرای هم‌زمان/دوباره جلوگیری می‌کند (race condition).
+    s = sess.get(chat_id)
+    if not s or getattr(s, "finishing", False):
+        return
+    s.finishing = True
+
     s = sess.remove(chat_id)
     if not s:
         return
@@ -3992,21 +4304,16 @@ async def _finish(ctx, chat_id, reason=None):
     # ---- مود اسم‌وفامیل ----
     if s.mode_id == "namefamily" and s.mode:
         s.mode.lock()
-
         evaluated = s.mode.evaluate(s.players)
 
-        # پاسخ‌های نامعتبر را وارد صف پیشنهاد کن
         for uid, data in evaluated.items():
             for cell in data["cells"]:
                 if cell["status"] == "❌" and cell["answer"] != "—":
                     db.add_suggestion(
-                        user_id=uid,
-                        user_name=data["name"],
-                        word=cell["answer"],
-                        category=cell["cat"],
+                        user_id=uid, user_name=data["name"],
+                        word=cell["answer"], category=cell["cat"],
                         description="پیشنهاد خودکار از پاسخ نامعتبر اسم‌وفامیل",
-                        source="namefamily"
-                    )
+                        source="namefamily")
 
         for uid, data in evaluated.items():
             if uid in s.players:
@@ -4014,69 +4321,50 @@ async def _finish(ctx, chat_id, reason=None):
 
         ranking = s.ranking()
         winner = ranking[0][0] if ranking and ranking[0][1]["score"] > 0 else None
-
         for uid, info in ranking:
-            svc.record_game(
-                uid,
-                info["name"],
-                won=(uid == winner),
-                score=info["score"]
-            )
+            svc.record_game(uid, info["name"], won=(uid == winner), score=info["score"])
 
         match_id = db.add_match_report(
-            chat_id=chat_id,
-            mode=s.mode_name(),
-            winner_id=winner,
-            players_count=len(ranking)
-        )
+            chat_id=chat_id, mode=s.mode_name(),
+            winner_id=winner, players_count=len(ranking))
 
-        box_lines = []
-        for uid, info in ranking:
-            item = lucky_box.try_grant(uid, match_id=match_id)
-            if item:
-                box_lines.append(
-                    f"🎁 <b>{info['name']}</b> یک Lucky Box گرفت: {lucky_box.item_text(item)}"
-                )
-
+        box_lines = _grant_boxes(lucky_box, ranking, match_id)
         text = s.mode.result_text(s.players)
         if box_lines:
-            text += "\n\n🎁 <b>Lucky Box</b>\n" + "\n".join(box_lines)
-
-        # طبق درخواست: پیام جدید ارسال می‌شود، پیام اصلی بازی Edit نمی‌شود.
+            text += "\n\n🎁 <b>جعبه شانس</b>\n" + "\n".join(box_lines)
         await ctx.bot.send_message(chat_id, text, parse_mode=HTML)
         return
 
     # ---- بقیه مودها ----
     ranking = s.ranking()
-    medals = ["🥇", "🥈", "🥉"]
-    lines = []
-    for i, (uid, info) in enumerate(ranking):
-        badge = medals[i] if i < 3 else f"{i+1}."
-        lines.append(f"{badge} <b>{info['name']}</b> — {info['score']} امتیاز")
     winner = ranking[0][0] if ranking and ranking[0][1]["score"] > 0 else None
     for uid, info in ranking:
         svc.record_game(uid, info["name"], won=(uid == winner), score=info["score"])
 
     match_id = db.add_match_report(
-        chat_id=chat_id,
-        mode=s.mode_name(),
-        winner_id=winner,
-        players_count=len(ranking)
-    )
+        chat_id=chat_id, mode=s.mode_name(),
+        winner_id=winner, players_count=len(ranking))
 
+    box_lines = _grant_boxes(lucky_box, ranking, match_id)
+    text = panels.finish_text(s, reason=reason)
+    if box_lines:
+        text += "\n\n🎁 <b>جعبه شانس</b>\n" + "\n".join(box_lines)
+    await ctx.bot.send_message(chat_id, text, parse_mode=HTML)
+
+
+def _grant_boxes(lucky_box, ranking, match_id):
+    """برای هر بازیکن شانس «🎁 جعبه شانس» را بررسی می‌کند و خطوط نمایش می‌سازد."""
     box_lines = []
     for uid, info in ranking:
-        item = lucky_box.try_grant(uid, match_id=match_id)
+        try:
+            item = lucky_box.try_grant(uid, match_id=match_id)
+        except Exception:
+            log.exception("خطا در اعطای جعبه شانس به کاربر %s", uid)
+            continue
         if item:
             box_lines.append(
-                f"🎁 <b>{info['name']}</b> یک Lucky Box گرفت: {lucky_box.item_text(item)}"
-            )
-
-    text = panels.finish_text(s, reason=reason) 
-    if box_lines:
-        text += "\n\n🎁 <b>Lucky Box</b>\n" + "\n".join(box_lines)
-
-    await ctx.bot.send_message(chat_id, text, parse_mode=HTML)
+                f"🎁 <b>{info['name']}</b> یک جعبه شانس گرفت: {lucky_box.item_text(item)}")
+    return box_lines
 
 
 # ---------- پیام‌های گروه هنگام بازی ----------
@@ -4102,16 +4390,14 @@ async def on_group_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # --- مودهای سوال‌محور ---
     res = s.submit(u.id, nm, text)
-    if res and res["ok"]:
-        found, total = s.progress()
 
-        await msg.reply_text(
-            panels.answer_ok_text(
-                res["score"],
-                found,
-                total,
-            )
-        )
+    if res and res.get("ok"):
+        found = res.get("found")
+        total = res.get("total")
+        if found is None or total is None:
+            found, total = s.progress()
+
+        await msg.reply_text(panels.answer_ok_text(res["score"], found, total))
 
         if s.is_completed():
             await _finish(ctx, chat.id, reason="completed")
@@ -4119,10 +4405,19 @@ async def on_group_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         s.next_question()
         await _update_live(ctx, s)
-
-
         return True
+
+    # پاسخ تکراری: فقط یک تذکر کوتاه، بدون کسر امتیاز.
+    if res and res.get("reason") == "duplicate":
+        try:
+            await msg.reply_text("♻️ این کلمه قبلاً گفته شده!")
+        except Exception:
+            pass
+        return True
+
+    # پاسخ اشتباه یا نامرتبط → حالت تمرکز را بررسی کن.
     return await _maybe_focus(ctx, s, msg, text, u, is_answer=res is not None)
+
 
 async def _maybe_focus(ctx, s, msg, text, u, is_answer):
     if not s.focus_mode:
@@ -4130,7 +4425,6 @@ async def _maybe_focus(ctx, s, msg, text, u, is_answer):
     too_long = len(text.split()) > FOCUS_WORD_LIMIT
     if is_answer or not too_long:
         return False
-    # سازنده و ادمین‌های گروه معاف‌اند
     if await _is_privileged(ctx, s, s.chat_id, u.id):
         return False
     await _safe_delete(msg)
@@ -4152,6 +4446,7 @@ async def handle_start_during_game(update, ctx):
     return await _warn_and_maybe_mute(
         ctx, s, chat.id, u, "وقتی بازی فعاله نمی‌تونی بازی جدید شروع کنی")
 
+
 def _load_category_for_session(s):
     if s.mode_id == "classic_choice" and not s.category:
         return False
@@ -4163,50 +4458,36 @@ def _load_category_for_session(s):
     s.words = db.list_words(s.category) or []
     return bool(s.words) or s.is_round_based()
 
+
 def _player_mentions(s):
     return " ".join(
         f'<a href="tg://user?id={uid}">{html.escape(info.get("name") or "بازیکن")}</a>'
-        for uid, info in s.players.items()
-    )
+        for uid, info in s.players.items())
+
 
 def _suggestion_hint(text):
     t = (text or "").strip()
-    return (
-        t.startswith("+کلمه")
-        or t.startswith("پیشنهاد کلمه")
-        or t.startswith("/suggest")
-    )
+    return (t.startswith("+کلمه") or t.startswith("پیشنهاد کلمه")
+            or t.startswith("/suggest"))
+
 
 async def _handle_group_suggestion(update, ctx, s, text):
     from features import suggestion_service as ss
-
     raw = text.strip()
-
     for prefix in ("+کلمه", "پیشنهاد کلمه", "/suggest"):
         if raw.startswith(prefix):
             raw = raw[len(prefix):].strip()
             break
-
     parts = [p.strip() for p in raw.split("|")]
-
     if len(parts) < 2:
-        return await update.message.reply_text(
-            "فرمت: +کلمه کلمه | دسته | توضیح اختیاری"
-        )
-
+        return await update.message.reply_text("فرمت: +کلمه کلمه | دسته | توضیح اختیاری")
     u = update.effective_user
-
     ok, msg = ss.create(
-        u.id,
-        u.first_name,
-        parts[0],
-        parts[1],
-        parts[2] if len(parts) > 2 else "",
-        source="game",
-    )
-
+        u.id, u.first_name, parts[0], parts[1],
+        parts[2] if len(parts) > 2 else "", source="game")
     await update.message.reply_text(("✅ " if ok else "⚠️ ") + msg)
     return True
+
 ```
 
 
@@ -4975,6 +5256,281 @@ if __name__ == "__main__":
 
 
 ================================================================================
+FILE: MIGRATION_GUIDE_fa.md
+================================================================================
+
+```md
+# مهاجرت کلمو از SQLite به PostgreSQL (روی Render، سازگار با ایران)
+
+این راهنما تمام مراحل انتقال ربات تلگرام «کلمو» از SQLite به PostgreSQL را
+قدم‌به‌قدم توضیح می‌دهد. **رفتار و امکانات ربات دقیقاً مثل قبل باقی می‌ماند** —
+فقط لایه‌ی ذخیره‌سازی عوض شده است.
+
+---
+
+## ۱) چرا این مهاجرت لازم بود؟
+
+روی پلن رایگان Render، فایل‌سیستم **موقتی (ephemeral)** است. هر بار که سرویس
+دیپلوی مجدد یا ری‌استارت می‌شود، فایل `kalemo.db` پاک می‌شود و همه‌ی بازیکن‌ها،
+سکه‌ها، پیشرفت‌ها و باغچه‌ها از بین می‌روند. PostgreSQLِ Render یک دیتابیس
+**پایدار و جدا از سرویس** است، بنابراین داده‌ها باقی می‌مانند.
+
+---
+
+## ۲) چه چیزهایی تغییر کرد؟
+
+نکته‌ی کلیدی: **تمام کدهای SQLite فقط در دو فایل بودند** — `core/db.py` و
+`core/garden_db.py`. بقیه‌ی پروژه (هندلرها، مودهای بازی، UI، سرویس‌ها) همگی
+از توابع `db.*` استفاده می‌کنند. چون **امضای همه‌ی توابع عمومی بدون تغییر مانده**،
+هیچ فایل دیگری نیاز به تغییر ندارد.
+
+فایل‌هایی که باید جایگزین شوند:
+
+| فایل | تغییر |
+| --- | --- |
+| `core/db.py` | بازنویسی کامل با psycopg ۳ + connection pool |
+| `core/garden_db.py` | بازنویسی کامل با psycopg ۳ |
+| `config.py` | افزودن `DB_POOL_MAX` و توضیح `DATABASE_URL` |
+| `requirements.txt` | حذف `SQLAlchemy` (استفاده نمی‌شد)، افزودن `psycopg-pool` |
+
+فایل‌هایی که **دست‌نخورده** می‌مانند: `main.py`, `web.py`, همه‌ی `handlers/*`,
+همه‌ی `game/*`, `features/*`, `ui/*`, `seeds.py`, `runtime.txt`.
+
+### جزئیات فنی تغییرات کد
+
+| مورد در SQLite | معادل در PostgreSQL |
+| --- | --- |
+| `sqlite3.connect(path)` | `ConnectionPool(DATABASE_URL)` |
+| `row_factory = sqlite3.Row` | `row_factory = dict_row` |
+| placeholder `?` | placeholder `%s` |
+| `INTEGER PRIMARY KEY AUTOINCREMENT` | `INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY` |
+| `INTEGER` برای `user_id/chat_id` | `BIGINT` (آی‌دی‌های تلگرام بزرگ‌اند) |
+| `cursor.lastrowid` | `INSERT ... RETURNING id` سپس `fetchone()["id"]` |
+| `INSERT OR IGNORE` | `INSERT ... ON CONFLICT DO NOTHING` |
+| `executescript(...)` | `execute(...)` (psycopg چند دستور را می‌پذیرد) |
+| `sqlite3.IntegrityError` | `psycopg.errors.UniqueViolation` (به‌صورت `db.IntegrityError` هم در دسترس است) |
+| `PRAGMA table_info(t)` | کوئری روی `information_schema.columns` |
+| `PRAGMA foreign_keys=ON` | حذف شد (کلیدهای خارجی در Postgres به‌صورت پیش‌فرض اعمال می‌شوند) |
+
+> نکته درباره‌ی UPSERT: در Postgres وقتی در بخش `DO UPDATE` به ستونی ارجاع می‌دهید
+> که هم در جدول و هم در ردیف جدید وجود دارد، باید نام جدول را ذکر کنید
+> (مثلاً `garden_seeds.qty + 1` به‌جای `qty + 1`). این نکته اصلاح شده است.
+
+### سازگاری با کد قدیمی
+اگر جایی در پروژه `sqlite3.IntegrityError` را می‌گرفتید، حالا از `db.IntegrityError`
+استفاده کنید (که به `psycopg.errors.UniqueViolation` اشاره می‌کند). در کد فعلی شما
+این خطا فقط داخل خودِ `db.py` استفاده می‌شود، پس نیازی به تغییر جای دیگری نیست.
+
+---
+
+## ۳) داده‌های موجود
+
+شما انتخاب کردید که با یک **دیتابیس خالی تازه** شروع کنید. با اولین اجرا،
+تابع `db.init()` (که در `build_app()` داخل `main.py` صدا زده می‌شود) به‌صورت
+خودکار جدول‌ها را می‌سازد و بانک کلمات NameFamily و دسته‌های پیش‌فرض را seed می‌کند.
+پس نیازی به هیچ اسکریپت انتقال داده نیست. (بازیکن‌ها و پیشرفت‌ها از صفر شروع می‌شوند.)
+
+---
+
+## ۴) چرا این گزینه از ایران کار می‌کند؟
+
+- **دیتابیس روی خود Render** است و از طریق **Internal Database URL** به سرویس ربات
+  وصل می‌شود. این اتصال داخل شبکه‌ی Render برقرار می‌شود، نه از داخل ایران.
+- شما فقط برای **دیپلوی و مدیریت پنل Render** به اینترنت وصل می‌شوید؛ اگر
+  render.com برایتان باز نشد، از یک VPN/پروکسی فقط برای باز کردن پنل استفاده کنید.
+  خودِ ربات و دیتابیس در دیتاسنتر Render اجرا می‌شوند و به فیلترینگ ایران ربطی ندارند.
+- سرویس‌هایی که معمولاً از ایران دردسر دارند (مثلاً بعضی پنل‌های ابری) اینجا دور
+  زده می‌شوند چون کل استک روی Render است.
+
+---
+
+## ۵) ساخت دیتابیس PostgreSQL روی Render
+
+1. وارد داشبورد Render شوید → **New +** → **PostgreSQL**.
+2. یک نام بگذارید (مثلاً `kalemo-db`)، **Region** را همان ریجن سرویس ربات انتخاب کنید
+   (مهم است که هر دو در یک ریجن باشند تا Internal URL کار کند)، و **Free** را انتخاب کنید.
+3. **Create Database** را بزنید و چند دقیقه صبر کنید تا وضعیت «Available» شود.
+4. وارد صفحه‌ی دیتابیس شوید → بخش **Connections**:
+   - **Internal Database URL** را کپی کنید (این را برای سرویس ربات استفاده می‌کنیم).
+   - (اختیاری) **External Database URL** برای اتصال از بیرون است.
+
+> ⚠️ دیتابیس رایگان Render بعد از **۳۰ روز منقضی** می‌شود. برای پروژه‌ی جدی
+> بعداً پلن پولی بگیرید یا از Neon (رایگان و بدون انقضا) استفاده کنید. اگر روزی
+> به Neon رفتید، فقط کافی است `DATABASE_URL` را عوض کنید؛ کد بدون تغییر کار می‌کند.
+> (برای Neon معمولاً باید `?sslmode=require` به انتهای URL اضافه شود.)
+
+---
+
+## ۶) تنظیم متغیرهای محیطی
+
+### روی Render (سرویس ربات — Web Service)
+وارد سرویس ربات شوید → **Environment** → **Add Environment Variable** و این‌ها را بسازید:
+
+| Key | Value |
+| --- | --- |
+| `DATABASE_URL` | همان **Internal Database URL** که کپی کردید |
+| `KALEMO_BOT_TOKEN` | توکن ربات از @BotFather |
+| `KALEMO_BOT_USERNAME` | یوزرنیم ربات بدون @ |
+| `KALEMO_ADMINS` | آیدی عددی ادمین‌ها، با کاما: `1053046454` |
+| `DB_POOL_MAX` | `5` (اختیاری) |
+
+`PORT` را Render خودش ست می‌کند؛ لازم نیست دستی بگذارید (کد از `os.environ["PORT"]` می‌خواند).
+
+### روی سیستم خودتان (تست محلی)
+یک فایل `.env` کنار پروژه بسازید:
+
+```
+KALEMO_BOT_TOKEN=123:ABC
+KALEMO_BOT_USERNAME=KalemoBot
+KALEMO_ADMINS=1053046454
+DATABASE_URL=postg://user:pass@host:5432/dbname
+DB_POOL_MAX=5
+```
+
+> اگر می‌خواهید محلی هم واقعاً به Postgress وصل شوید، می‌توانید External Database URL
+> را در `.env` بگذارید. فایل `.env` را حتماً در `.gitignore` قرار دهید.
+
+---
+
+## ۷) جایگزینی فایل‌ها
+
+فایل‌های موجود در پوشه‌ی `kalemo_pg/` را جایگزین فایل‌های هم‌نام در پروژه کنید:
+
+```
+kalemo_pg/config.py            →  config.py
+kalemo_pg/requirements.txt     →  requirements.txt
+kalemo_pg/core/db.py           →  core/db.py
+kalemo_pg/core/garden_db.py    →  core/garden_db.py
+```
+
+بقیه‌ی فایل‌ها را دست نزنید.
+
+---
+
+## ۸) دیپلوی روی Render
+
+تنظیمات سرویس ربات (Web Service):
+
+- **Build Command:** `pip install -r requirements.txt`
+- **Start Command:** `python main.py`
+- **Instance Type:** Free
+
+بعد از set کردن متغیرهای محیطی، **Manual Deploy → Deploy latest commit** را بزنید.
+با اولین اجرا، `db.init()` جدول‌ها را می‌سازد و کلمات را seed می‌کند. در لاگ باید ببینید:
+
+```
+Menu button & commands registered.
+Kalemo is running…
+```
+
+اگر `DATABASE_URL` ست نشده باشد، ربات با پیام واضح
+«DATABASE_URL تنظیم نشده است...» بالا نمی‌آید — این عمدی است تا زود متوجه شوید.
+
+---
+
+## ۹) بررسی سلامت
+
+- به آدرس سرویس (`https://<your-service>.onrender.com/`) بروید؛ باید ببینید
+  `Kalemo Bot is alive!`.
+- در تلگرام `/start` بزنید؛ باید پروفایل و منو بیاید.
+- یک بازی گروهی یا NameFamily انجام دهید و مطمئن شوید سکه/XP ذخیره می‌شود.
+- سرویس را یک‌بار **Restart** کنید و دوباره `/profile` بزنید — این بار **داده‌ها
+  باقی می‌مانند** (که کل هدف مهاجرت بود). ✅
+
+---
+
+## ۱۰) استفاده از Supabase به‌جای Render Postgres
+
+خبر خوب: کدی که نوشتیم (`core/db.py`) از هر آدرس استاندارد PostgreSQL پشتیبانی
+می‌کند، پس نیازی به تغییر هیچ کد دیگری نیست — فقط کافی‌ست `DATABASE_URL` درست
+تنظیم شود. اما ⚠️ **نکته‌ی خیلی مهم**: کانکشن‌استرینگی که فرستادید
+(`db.pzalhcdhctrzesxqsyvz.supabase.co:5432`) آدرس **مستقیم (Direct Connection)**
+سوپابیس است که این روزها **فقط IPv6** است. سرورهای Render (پلن رایگان) از
+شبکه‌ی IPv4 خارج می‌شوند، پس این اتصال معمولاً با خطای timeout/connection refused
+روی Render شکست می‌خورد. راه‌حل: به‌جای Direct Connection از **Connection Pooler**
+سوپابیس استفاده کنید که IPv4-friendly است.
+
+### ۱۰.۱) گرفتن آدرس درست از پنل Supabase
+
+1. وارد پروژه‌ی Supabase شوید → **Project Settings** (⚙️) → **Database**.
+2. بخش **Connection string** را باز کنید.
+3. تب **Connection pooling** را انتخاب کنید (نه «Direct connection»).
+4. حالت (Mode) را روی **Session** بگذارید (چون کد ما هر بار یک تراکنش کامل
+   با `commit/rollback` انجام می‌دهد و به‌جز pool خودمان، pooler هم لازم داریم؛
+   Session mode برای این الگو مطمئن‌تر است. اگر بعداً خواستید Transaction mode
+   را هم امتحان کنید مشکلی نیست).
+5. آدرسی که نشان داده می‌شود شبیه این است (پورت و هاست فرق می‌کند با Direct):
+
+   ```
+   postgresql://postgres.pzalhcdhctrzesxqsyvz:[YOUR-PASSWORD]@aws-0-<region>.pooler.supabase.com:5432/postgres
+   ```
+
+   (دقت کنید: یوزرنیم اینجا به‌صورت `postgres.<project-ref>` است، نه فقط `postgres`.
+   هاست هم `pooler.supabase.com` است، نه `supabase.co`.)
+
+6. به‌جای `[YOUR-PASSWORD]` پسورد دیتابیسی که هنگام ساخت پروژه تعیین کردید را
+   بگذارید. اگر یادتان نیست، در همان صفحه دکمه‌ی **Reset database password**
+   هست.
+
+7. در انتهای این آدرس عبارت `?sslmode=require` را اضافه کنید (Supabase روی
+   اتصال بدون SSL را می‌بندد):
+
+   ```
+   postgresql://postgres.pzalhcdhctrzesxqsyvz:MyStrongPass123@aws-0-eu-central-1.pooler.supabase.com:5432/postgres?sslmode=require
+   ```
+
+### ۱۰.۲) ست‌کردن در Render
+
+وارد سرویس ربات در Render شوید → **Environment** → مقدار `DATABASE_URL` را
+دقیقاً با همین آدرس نهایی (پولر + پسورد واقعی + `?sslmode=require`) جایگزین کنید.
+بقیه‌ی متغیرها (`KALEMO_BOT_TOKEN`, `KALEMO_BOT_USERNAME`, `KALEMO_ADMINS`,
+`DB_POOL_MAX`) همان‌طور که در بخش ۶ گفته شد باقی می‌مانند.
+
+> اگر پسورد شما در خودش کاراکترهای خاص دارد (مثل `@`, `:`, `/`, `#`) باید
+> URL-encode شود، وگرنه اتصال parse نمی‌شود. مثلاً `@` می‌شود `%40`.
+> ساده‌ترین راه: یک پسورد ساده‌ی فقط حروف/عدد برای دیتابیس بسازید تا این مشکل
+> پیش نیاید (از همان دکمه‌ی Reset database password).
+
+### ۱۰.۳) دیپلوی و تست
+
+1. **Manual Deploy → Deploy latest commit** را در Render بزنید.
+2. در لاگ سرویس دنبال خط `Kalemo is running…` بگردید؛ اگر خطای اتصال دیدید
+   (`could not translate host name` یا `timeout`) یعنی هنوز از Direct Connection
+   استفاده می‌کنید — به قدم ۱۰.۱ برگردید و مطمئن شوید از آدرس Pooler استفاده
+   کرده‌اید.
+3. در تلگرام `/start` بزنید و یک بازی انجام دهید.
+4. برای اطمینان از ماندگاری داده: در پنل Supabase → **Table Editor** بروید و
+   جدول `players` را باز کنید؛ باید ردیف بازیکن‌تان را ببینید.
+5. سرویس Render را **Restart** کنید و دوباره `/profile` بزنید — چون Supabase
+   منقضی نمی‌شود، **هیچ‌وقت** داده پاک نمی‌شود، حتی بعد از دیپلوی‌های مکرر. ✅
+
+### ۱۰.۴) چرا Supabase انتخاب خوبی است
+- دیتابیس رایگان Supabase **منقضی نمی‌شود** (برخلاف Render Postgres رایگان که
+  بعد از ۳۰ روز پاک می‌شود) — پروژه فقط اگر ۷ روز کامل هیچ فعالیتی نداشته باشد
+  به حالت Pause می‌رود که با یک بازدید از پنل یا اولین ریکوئست دوباره فعال می‌شود.
+- از ایران معمولاً در دسترس است (چون فقط سرویس ربات روی Render با آن صحبت
+  می‌کند، نه دستگاه شما مستقیماً).
+- کد فعلی نیازی به هیچ تغییری برای Supabase نداشت؛ فقط `DATABASE_URL` عوض شد.
+
+---
+
+## ۱۱) اشکال‌زدایی
+
+| علامت | علت محتمل | راه‌حل |
+| --- | --- | --- |
+| `RuntimeError: DATABASE_URL تنظیم نشده` | متغیر محیطی ست نشده | در Environment سرویس، `DATABASE_URL` را بگذارید |
+| `connection refused` / timeout | استفاده از External URL یا ریجن متفاوت | از **Internal** URL و همان ریجن استفاده کنید |
+| `SSL required` | provider خارجی (مثل Neon) | به انتهای URL `?sslmode=require` اضافه کنید |
+| `too many connections` | pool بزرگ | `DB_POOL_MAX` را کم کنید (مثلاً `3`) |
+| جدول‌ها ساخته نمی‌شوند | `db.init()` صدا زده نشده | مطمئن شوید `main.py` بدون خطا `build_app()` را اجرا می‌کند |
+| `could not translate host name "db.xxx.supabase.co"` | استفاده از Direct Connection که IPv6-only است | آدرس **Pooler** (`*.pooler.supabase.com`) را از بخش ۱۰ استفاده کنید |
+| `password authentication failed` | پسورد اشتباه یا کاراکتر خاص URL-encode نشده | پسورد را Reset کنید و یک پسورد ساده (فقط حروف/عدد) بگذارید |
+| `SSL connection required` | فراموش‌کردن `?sslmode=require` | به انتهای `DATABASE_URL` این را اضافه کنید |
+
+```
+
+
+================================================================================
 FILE: project_dump.md
 ================================================================================
 
@@ -5002,12 +5558,19 @@ FILE: config.py
 """
 import os
 from dotenv import load_dotenv
-# توکن ربات (از @BotFather) — حتماً به‌صورت متغیر محیطی ست شود.
-
 
 load_dotenv()
+
+# توکن ربات (از @BotFather) — حتماً به‌صورت متغیر محیطی ست شود.
 BOT_TOKEN = os.getenv("KALEMO_BOT_TOKEN")
+
+# آدرس اتصال به PostgreSQL. روی Render مقدار «Internal Database URL» را اینجا بگذارید.
+# مثال: postg://user:pass@host:5432/dbname
 DATABASE_URL = os.getenv("DATABASE_URL")
+
+# حداکثر اندازه‌ی connection pool. روی پلن رایگان Render کوچک نگه دارید.
+DB_POOL_MAX = int(os.getenv("DB_POOL_MAX", "5"))
+
 # یوزرنیم ربات (بدون @) — برای لینک افزودن به گروه
 BOT_USERNAME = os.getenv("KALEMO_BOT_USERNAME")
 
@@ -5017,7 +5580,7 @@ ADMIN_IDS = {
     if x.strip().lstrip("-").isdigit()
 }
 
-# مسیر دیتابیس
+# مسیر دیتابیس SQLite دیگر استفاده نمی‌شود؛ فقط برای سازگاری عقب‌رو نگه داشته شده.
 DB_PATH = os.environ.get("KALEMO_DB", "kalemo.db")
 
 # فاصله زمانی مجاز برای تغییر نام نمایشی (ثانیه) — پیش‌فرض ۷ روز
@@ -5041,54 +5604,106 @@ FILE: core\db.py
 
 ```py
 # -*- coding: utf-8 -*-
-"""لایه دیتابیس Kalemo.
+"""لایه دیتابیس Kalemo — نسخه‌ی PostgreSQL.
 
-شامل:
-- بازیکنان و نام نمایشی
-- ماموریت‌های روزانه
-- دسته‌بندی و کلمات (با نرمال‌سازی برای مقایسه)
-- پیشنهاد کلمات توسط کاربران
-- گزارش مسابقات
-- لاگ تغییرات ادمین
-- Lucky Box
-- ادمین‌های همکار
+این فایل جایگزین نسخه‌ی SQLite است. تمام امضاهای توابع عمومی (public API)
+دقیقاً مثل قبل باقی مانده‌اند، بنابراین هیچ فایل دیگری در پروژه نیازی به
+تغییر ندارد. فقط لایه‌ی ذخیره‌سازی از SQLite به PostgreSQL منتقل شده است.
+
+نکات مهاجرت:
+- به‌جای sqlite3 از psycopg (نسخه ۳) استفاده می‌شود.
+- کانکشن از طریق یک ConnectionPool مدیریت می‌شود (مناسب پلن رایگان Render).
+- placeholder پارامترها از «?» به «%s» تغییر کرده است.
+- AUTOINCREMENT → GENERATED / SERIAL (اینجا از GENERATED ALWAYS AS IDENTITY).
+- lastrowid → INSERT ... RETURNING id.
+- INSERT OR IGNORE → INSERT ... ON CONFLICT DO NOTHING.
+- executescript → execute (psycopg چند دستور را در یک رشته اجرا می‌کند).
+- خطای یکتایی sqlite3.IntegrityError → psycopg.errors.UniqueViolation.
+- PRAGMA table_info → information_schema.columns.
 """
 
-import re
-import psycopg
-import os
-import config
 import time
 from contextlib import contextmanager
-from core.garden_db import init_garden
-import config
 
-DB_PATH = config.DB_PATH
+import psycopg
+from psycopg.rows import dict_row
+from psycopg_pool import ConnectionPool
+
+import config
+from core.garden_db import init_garden
+
+# سازگاری عقب‌رو: هر جای پروژه که db.IntegrityError را می‌گیرد کار کند.
+IntegrityError = psycopg.errors.UniqueViolation
+
+# ---------- connection pool ----------
+# روی پلن رایگان Render تعداد کانکشن‌ها محدود است؛ pool کوچک نگه داشته می‌شود.
+_DSN = config.DATABASE_URL
+if not _DSN:
+    raise RuntimeError(
+        "DATABASE_URL تنظیم نشده است. در Render → Environment مقدار "
+        "Internal Database URL دیتابیس PostgreSQL را ست کنید."
+    )
+
+_pool = ConnectionPool(
+    conninfo=_DSN,
+    min_size=1,
+    max_size=int(config.DB_POOL_MAX),
+    kwargs={"row_factory": dict_row, "autocommit": False},
+    open=True,
+)
 
 
 @contextmanager
 def conn():
-    c = sqlite3.connect(DB_PATH)
-    c.row_factory = sqlite3.Row
-    c.execute("PRAGMA foreign_keys=ON")
-    try:
-        yield c
-        c.commit()
-    finally:
-        c.close()
+    """یک کانکشن از pool می‌گیرد، cursor با دسترسی مثل dict برمی‌گرداند.
+
+    برای حفظ سازگاری با کد قدیمی، شیءِ yield شده یک wrapper است که
+    متد execute() آن یک cursor برمی‌گرداند (دقیقاً مثل sqlite3.Connection.execute).
+    """
+    with _pool.connection() as c:
+        try:
+            yield _ConnShim(c)
+            c.commit()
+        except Exception:
+            c.rollback()
+            raise
+
+
+class _ConnShim:
+    """سازگاری با API قدیمی sqlite3.
+
+    در sqlite3، connection.execute(sql, params) خودش یک cursor برمی‌گرداند
+    که می‌شود روی آن fetchone/fetchall/rowcount صدا زد. اینجا همان رفتار را
+    شبیه‌سازی می‌کنیم تا کوئری‌های موجود بدون تغییر کار کنند.
+    """
+
+    def __init__(self, real_conn):
+        self._c = real_conn
+
+    def execute(self, sql, params=()):
+        # ترجمه‌ی خودکار placeholder «?» به «%s» تا کوئری‌ها دست‌نخورده بمانند.
+        if "?" in sql:
+            sql = sql.replace("?", "%s")
+        cur = self._c.cursor()
+        cur.execute(sql, params)
+        return cur
+
+    def cursor(self):
+        return self._c.cursor()
 
 
 # ---------- normalization ----------
-
-# ---------- normalization ----------
-from core.normalize import normalize_word  # noqa: F401  (سازگاری عقب‌رو)
+from core.normalize import normalize_word  # noqa: E402,F401  (سازگاری عقب‌رو)
 
 
 # ---------- schema helpers ----------
 
 def _table_columns(c, table):
-    rows = c.execute(f"PRAGMA table_info({table})").fetchall()
-    return {r["name"] for r in rows}
+    rows = c.execute(
+        "SELECT column_name FROM information_schema.columns WHERE table_name=%s",
+        (table,),
+    ).fetchall()
+    return {r["column_name"] for r in rows}
 
 
 def _ensure_column(c, table, column, ddl):
@@ -5098,12 +5713,13 @@ def _ensure_column(c, table, column, ddl):
 
 def init():
     with conn() as c:
-        c.executescript("""
+        # در PostgreSQL کلید افزایشی با IDENTITY ساخته می‌شود.
+        c.execute("""
         CREATE TABLE IF NOT EXISTS players (
-            user_id         INTEGER PRIMARY KEY,
+            user_id         BIGINT PRIMARY KEY,
             name            TEXT,
             display_name    TEXT,
-            name_changed_at INTEGER DEFAULT 0,
+            name_changed_at BIGINT DEFAULT 0,
             level           INTEGER DEFAULT 1,
             xp              INTEGER DEFAULT 0,
             coins           INTEGER DEFAULT 0,
@@ -5114,11 +5730,11 @@ def init():
             best_score      INTEGER DEFAULT 0,
             onboarded       INTEGER DEFAULT 0,
             accepted_words  INTEGER DEFAULT 0,
-            created_at      INTEGER
+            created_at      BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS mission_progress (
-            user_id   INTEGER,
+            user_id   BIGINT,
             day       TEXT,
             progress  INTEGER DEFAULT 0,
             claimed   INTEGER DEFAULT 0,
@@ -5126,12 +5742,12 @@ def init():
         );
 
         CREATE TABLE IF NOT EXISTS categories (
-            id    INTEGER PRIMARY KEY AUTOINCREMENT,
+            id    INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             name  TEXT UNIQUE
         );
 
         CREATE TABLE IF NOT EXISTS words (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            id              INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
             category_id     INTEGER NOT NULL,
             word            TEXT NOT NULL,
             normalized_word TEXT DEFAULT '',
@@ -5141,21 +5757,21 @@ def init():
             synonyms        TEXT DEFAULT '',
             clue            TEXT DEFAULT '',
             usage_count     INTEGER DEFAULT 0,
-            last_used_by    INTEGER,
-            last_used_at    INTEGER,
+            last_used_by    BIGINT,
+            last_used_at    BIGINT,
             UNIQUE(category_id, word),
             FOREIGN KEY(category_id) REFERENCES categories(id) ON DELETE CASCADE
         );
 
         CREATE TABLE IF NOT EXISTS admins (
-            user_id  INTEGER PRIMARY KEY,
-            added_by INTEGER,
-            added_at INTEGER
+            user_id  BIGINT PRIMARY KEY,
+            added_by BIGINT,
+            added_at BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS word_suggestions (
-            id              INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id         INTEGER,
+            id              INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            user_id         BIGINT,
             user_name       TEXT,
             word            TEXT NOT NULL,
             normalized_word TEXT DEFAULT '',
@@ -5163,46 +5779,46 @@ def init():
             description     TEXT DEFAULT '',
             source          TEXT DEFAULT 'menu',
             status          TEXT DEFAULT 'pending',
-            admin_id        INTEGER,
+            admin_id        BIGINT,
             admin_note      TEXT DEFAULT '',
-            created_at      INTEGER,
-            reviewed_at     INTEGER
+            created_at      BIGINT,
+            reviewed_at     BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS match_reports (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            chat_id     INTEGER,
+            id          INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            chat_id     BIGINT,
             mode        TEXT,
-            winner_id   INTEGER,
+            winner_id   BIGINT,
             players     INTEGER DEFAULT 0,
-            created_at  INTEGER
+            created_at  BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS change_logs (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            admin_id    INTEGER,
+            id          INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            admin_id    BIGINT,
             action      TEXT,
             target_type TEXT,
             target_id   TEXT,
             detail      TEXT,
-            created_at  INTEGER
+            created_at  BIGINT
         );
 
         CREATE TABLE IF NOT EXISTS lucky_boxes (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id     INTEGER,
-            match_id    INTEGER,
+            id          INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+            user_id     BIGINT,
+            match_id    BIGINT,
             item_type   TEXT,
             item_value  TEXT,
             rarity      TEXT,
             opened      INTEGER DEFAULT 1,
-            created_at  INTEGER
+            created_at  BIGINT
         );
         """)
 
         # ---- migrations برای دیتابیس‌های قدیمی ----
         _ensure_column(c, "players", "display_name", "display_name TEXT")
-        _ensure_column(c, "players", "name_changed_at", "name_changed_at INTEGER DEFAULT 0")
+        _ensure_column(c, "players", "name_changed_at", "name_changed_at BIGINT DEFAULT 0")
         _ensure_column(c, "players", "accepted_words", "accepted_words INTEGER DEFAULT 0")
 
         _ensure_column(c, "words", "difficulty", "difficulty INTEGER DEFAULT 1")
@@ -5212,27 +5828,28 @@ def init():
         _ensure_column(c, "words", "clue", "clue TEXT DEFAULT ''")
         _ensure_column(c, "words", "normalized_word", "normalized_word TEXT DEFAULT ''")
         _ensure_column(c, "words", "usage_count", "usage_count INTEGER DEFAULT 0")
-        _ensure_column(c, "words", "last_used_by", "last_used_by INTEGER")
-        _ensure_column(c, "words", "last_used_at", "last_used_at INTEGER")
+        _ensure_column(c, "words", "last_used_by", "last_used_by BIGINT")
+        _ensure_column(c, "words", "last_used_at", "last_used_at BIGINT")
 
         c.execute("UPDATE words SET normalized_word='' WHERE normalized_word IS NULL")
 
         rows = c.execute("SELECT id, word FROM words WHERE normalized_word=''").fetchall()
         for r in rows:
             c.execute(
-                "UPDATE words SET normalized_word=? WHERE id=?",
-                (normalize_word(r["word"]), r["id"])
+                "UPDATE words SET normalized_word=%s WHERE id=%s",
+                (normalize_word(r["word"]), r["id"]),
             )
 
         c.execute("CREATE INDEX IF NOT EXISTS ix_words_normalized ON words(category_id, normalized_word)")
         c.execute("CREATE INDEX IF NOT EXISTS ix_suggestions_status ON word_suggestions(status)")
 
+        # partial unique index (نحو یکسان در Postgres)
         c.execute("""
         CREATE UNIQUE INDEX IF NOT EXISTS ux_players_display_name
         ON players(display_name)
         WHERE display_name IS NOT NULL AND TRIM(display_name) <> ''
         """)
-        
+
         init_garden(c)
 
     seed_defaults()
@@ -5243,7 +5860,7 @@ def init():
 
 def get_player(uid):
     with conn() as c:
-        r = c.execute("SELECT * FROM players WHERE user_id=?", (uid,)).fetchone()
+        r = c.execute("SELECT * FROM players WHERE user_id=%s", (uid,)).fetchone()
     return dict(r) if r else None
 
 
@@ -5256,13 +5873,14 @@ def ensure_player(uid, name):
     if p:
         if name and p.get("name") != name:
             with conn() as c:
-                c.execute("UPDATE players SET name=? WHERE user_id=?", (name, uid))
+                c.execute("UPDATE players SET name=%s WHERE user_id=%s", (name, uid))
         return get_player(uid)
 
     with conn() as c:
         c.execute(
-            "INSERT INTO players(user_id, name, created_at) VALUES (?, ?, ?)",
-            (uid, name or "", int(time.time()))
+            "INSERT INTO players(user_id, name, created_at) VALUES (%s, %s, %s) "
+            "ON CONFLICT (user_id) DO NOTHING",
+            (uid, name or "", int(time.time())),
         )
     return get_player(uid)
 
@@ -5277,10 +5895,10 @@ def save_player(uid, **fields):
         if bad:
             raise ValueError(f"Invalid player field(s): {', '.join(bad)}")
 
-        cols = ", ".join(f"{k}=?" for k in fields)
+        cols = ", ".join(f"{k}=%s" for k in fields)
         values = list(fields.values())
         values.append(uid)
-        c.execute(f"UPDATE players SET {cols} WHERE user_id=?", values)
+        c.execute(f"UPDATE players SET {cols} WHERE user_id=%s", values)
 
 
 def is_onboarded(uid):
@@ -5318,13 +5936,13 @@ def is_display_name_taken(name, exclude_uid=None):
     with conn() as c:
         if exclude_uid is None:
             r = c.execute(
-                "SELECT 1 FROM players WHERE display_name=? LIMIT 1",
-                (name,)
+                "SELECT 1 FROM players WHERE display_name=%s LIMIT 1",
+                (name,),
             ).fetchone()
         else:
             r = c.execute(
-                "SELECT 1 FROM players WHERE display_name=? AND user_id<>? LIMIT 1",
-                (name, exclude_uid)
+                "SELECT 1 FROM players WHERE display_name=%s AND user_id<>%s LIMIT 1",
+                (name, exclude_uid),
             ).fetchone()
     return r is not None
 
@@ -5339,13 +5957,13 @@ def set_display_name(uid, name):
         raise ValueError("display name cannot be empty")
 
     if is_display_name_taken(name, exclude_uid=uid):
-        raise sqlite3.IntegrityError("display name already taken")
+        raise IntegrityError("display name already taken")
 
     ensure_player(uid, "")
     with conn() as c:
         c.execute(
-            "UPDATE players SET display_name=?, name_changed_at=? WHERE user_id=?",
-            (name, int(time.time()), uid)
+            "UPDATE players SET display_name=%s, name_changed_at=%s WHERE user_id=%s",
+            (name, int(time.time()), uid),
         )
 
 
@@ -5364,8 +5982,8 @@ def stats():
 def get_mission_progress(uid, day):
     with conn() as c:
         r = c.execute(
-            "SELECT * FROM mission_progress WHERE user_id=? AND day=?",
-            (uid, day)
+            "SELECT * FROM mission_progress WHERE user_id=%s AND day=%s",
+            (uid, day),
         ).fetchone()
     return dict(r) if r else {"user_id": uid, "day": day, "progress": 0, "claimed": 0}
 
@@ -5374,9 +5992,9 @@ def bump_mission(uid, day, amount=1):
     with conn() as c:
         c.execute("""
         INSERT INTO mission_progress(user_id, day, progress)
-        VALUES (?, ?, ?)
+        VALUES (%s, %s, %s)
         ON CONFLICT(user_id, day)
-        DO UPDATE SET progress = progress + ?
+        DO UPDATE SET progress = mission_progress.progress + %s
         """, (uid, day, amount, amount))
 
 
@@ -5384,10 +6002,11 @@ def claim_mission(uid, day):
     with conn() as c:
         c.execute("""
         INSERT INTO mission_progress(user_id, day, claimed)
-        VALUES (?, ?, 1)
+        VALUES (%s, %s, 1)
         ON CONFLICT(user_id, day)
         DO UPDATE SET claimed = 1
         """, (uid, day))
+
 
 def claim_mission_atomic(uid, day, coins, xp):
     """اتمیک: اگر قبلاً claim نشده، claim را ثبت و سکه/XP را اعمال می‌کند.
@@ -5395,20 +6014,19 @@ def claim_mission_atomic(uid, day, coins, xp):
     from core.progression import add_xp
     with conn() as c:
         row = c.execute(
-            "SELECT claimed FROM mission_progress WHERE user_id=? AND day=?",
+            "SELECT claimed FROM mission_progress WHERE user_id=%s AND day=%s",
             (uid, day)).fetchone()
         if row and row["claimed"]:
             return False
-        # ثبت claim (اتمیک در همین تراکنش)
         c.execute("""INSERT INTO mission_progress(user_id, day, claimed)
-                     VALUES (?, ?, 1)
+                     VALUES (%s, %s, 1)
                      ON CONFLICT(user_id, day) DO UPDATE SET claimed=1""",
                   (uid, day))
-        p = c.execute("SELECT level, xp, coins FROM players WHERE user_id=?",
+        p = c.execute("SELECT level, xp, coins FROM players WHERE user_id=%s",
                       (uid,)).fetchone()
         if p:
             new_level, new_xp, _ = add_xp(p["level"], p["xp"], xp)
-            c.execute("UPDATE players SET coins=?, level=?, xp=? WHERE user_id=?",
+            c.execute("UPDATE players SET coins=%s, level=%s, xp=%s WHERE user_id=%s",
                       (p["coins"] + coins, new_level, new_xp, uid))
     return True
 
@@ -5416,18 +6034,31 @@ def claim_mission_atomic(uid, day, coins, xp):
 # ---------- leaderboard ----------
 
 def top_players(limit=10):
+    """لیدربورد کلی بر اساس best_score.
+
+    مرتب‌سازی قطعی (deterministic) طبق game.ranking:
+      1) best_score نزولی  2) wins نزولی  3) user_id صعودی (ثبت‌نام زودتر)
+    این تضمین می‌کند بازیکن با امتیاز کمتر هرگز بالاتر از بازیکن با امتیاز بیشتر
+    نمایش داده نشود، و در تساوی همیشه ترتیب یکسان و قطعی باشد.
+    خروجی نهایی قبل از برگشت با ranking.assert_sorted اعتبارسنجی می‌شود.
+    """
+    from game import ranking
     with conn() as c:
         rows = c.execute("""
         SELECT
             COALESCE(NULLIF(display_name, ''), name, 'کاربر') AS shown_name,
-            level,
-            best_score
+            best_score,
+            wins,
+            user_id
         FROM players
-        ORDER BY level DESC, best_score DESC, wins DESC
-        LIMIT ?
+        ORDER BY best_score DESC, wins DESC, user_id ASC
+        LIMIT %s
         """, (limit,)).fetchall()
 
-    return [(r["shown_name"], r["best_score"]) for r in rows]
+    result = [(r["shown_name"], r["best_score"]) for r in rows]
+    # گارد نهایی: اگر به هر دلیلی ترتیب خراب بود، همین‌جا شکست می‌خورد.
+    ranking.assert_sorted(result, score_getter=lambda t: t[1])
+    return result
 
 
 # ---------- categories & words ----------
@@ -5439,21 +6070,21 @@ def add_category(name):
 
     try:
         with conn() as c:
-            c.execute("INSERT INTO categories(name) VALUES (?)", (name,))
+            c.execute("INSERT INTO categories(name) VALUES (%s)", (name,))
         return True
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return False
 
 
 def del_category(name):
     with conn() as c:
-        cur = c.execute("DELETE FROM categories WHERE name=?", ((name or "").strip(),))
+        cur = c.execute("DELETE FROM categories WHERE name=%s", ((name or "").strip(),))
         return cur.rowcount > 0
 
 
 def get_category(name):
     with conn() as c:
-        r = c.execute("SELECT * FROM categories WHERE name=?", ((name or "").strip(),)).fetchone()
+        r = c.execute("SELECT * FROM categories WHERE name=%s", ((name or "").strip(),)).fetchone()
     return dict(r) if r else None
 
 
@@ -5480,7 +6111,7 @@ def find_word(category, word):
         r = c.execute("""
             SELECT *
             FROM words
-            WHERE category_id=? AND normalized_word=?
+            WHERE category_id=%s AND normalized_word=%s
             LIMIT 1
         """, (cat["id"], nw)).fetchone()
 
@@ -5517,7 +6148,7 @@ def add_word(category, word, difficulty=1, rarity=1, points=10, synonyms="", clu
                     category_id, word, normalized_word,
                     difficulty, rarity, points, synonyms, clue
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 cat["id"],
                 word,
@@ -5529,7 +6160,7 @@ def add_word(category, word, difficulty=1, rarity=1, points=10, synonyms="", clu
                 clue or "",
             ))
         return True
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         return False
 
 
@@ -5540,8 +6171,8 @@ def del_word(category, word):
 
     with conn() as c:
         cur = c.execute(
-            "DELETE FROM words WHERE category_id=? AND word=?",
-            (cat["id"], (word or "").strip())
+            "DELETE FROM words WHERE category_id=%s AND word=%s",
+            (cat["id"], (word or "").strip()),
         )
         return cur.rowcount > 0
 
@@ -5553,8 +6184,8 @@ def list_words(category):
 
     with conn() as c:
         rows = c.execute(
-            "SELECT word FROM words WHERE category_id=? ORDER BY word",
-            (cat["id"],)
+            "SELECT word FROM words WHERE category_id=%s ORDER BY word",
+            (cat["id"],),
         ).fetchall()
 
     return [r["word"] for r in rows]
@@ -5569,7 +6200,7 @@ def lex_rows(category):
         rows = c.execute("""
         SELECT word, difficulty, rarity, points, synonyms, clue, usage_count
         FROM words
-        WHERE category_id=?
+        WHERE category_id=%s
         ORDER BY word
         """, (cat["id"],)).fetchall()
 
@@ -5598,9 +6229,9 @@ def bump_word_use(category, word, user_id=None):
         cur = c.execute("""
         UPDATE words
         SET usage_count = COALESCE(usage_count, 0) + 1,
-            last_used_by = ?,
-            last_used_at = ?
-        WHERE category_id=? AND word=?
+            last_used_by = %s,
+            last_used_at = %s
+        WHERE category_id=%s AND word=%s
         """, (user_id, int(time.time()), cat["id"], (word or "").strip()))
         return cur.rowcount > 0
 
@@ -5610,6 +6241,7 @@ def random_category():
 
     cats = [n for n, cnt in list_categories() if cnt > 0]
     return random.choice(cats) if cats else None
+
 
 def import_words(records):
     added = 0
@@ -5624,19 +6256,19 @@ def import_words(records):
             if not word or not category:
                 skipped += 1
                 continue
-            cat = c.execute("SELECT id FROM categories WHERE name=?", (category,)).fetchone()
+            cat = c.execute("SELECT id FROM categories WHERE name=%s", (category,)).fetchone()
             if not cat:
                 try:
-                    c.execute("INSERT INTO categories(name) VALUES (?)", (category,))
-                    cat_id = c.execute("SELECT id FROM categories WHERE name=?", (category,)).fetchone()["id"]
-                except sqlite3.IntegrityError:
+                    c.execute("INSERT INTO categories(name) VALUES (%s)", (category,))
+                    cat_id = c.execute("SELECT id FROM categories WHERE name=%s", (category,)).fetchone()["id"]
+                except IntegrityError:
                     skipped += 1
                     continue
             else:
                 cat_id = cat["id"]
             nw = normalize_word(word)
             exists = c.execute(
-                "SELECT 1 FROM words WHERE category_id=? AND normalized_word=? LIMIT 1",
+                "SELECT 1 FROM words WHERE category_id=%s AND normalized_word=%s LIMIT 1",
                 (cat_id, nw)).fetchone()
             if exists:
                 skipped += 1
@@ -5644,7 +6276,7 @@ def import_words(records):
             try:
                 c.execute("""INSERT INTO words(category_id, word, normalized_word,
                              difficulty, rarity, points, synonyms, clue)
-                             VALUES (?,?,?,?,?,?,?,?)""",
+                             VALUES (%s,%s,%s,%s,%s,%s,%s,%s)""",
                           (cat_id, word, nw,
                            int(r.get("difficulty", 1) or 1),
                            int(r.get("rarity", 1) or 1),
@@ -5652,7 +6284,7 @@ def import_words(records):
                            r.get("synonyms", "") or "",
                            r.get("clue", "") or ""))
                 added += 1
-            except sqlite3.IntegrityError:
+            except IntegrityError:
                 skipped += 1
     return added, skipped
 
@@ -5693,7 +6325,7 @@ def add_suggestion(user_id, user_name, word, category, description="", source="m
 
         if cat_id:
             dup = c.execute(
-                "SELECT 1 FROM words WHERE category_id=? AND normalized_word=? LIMIT 1",
+                "SELECT 1 FROM words WHERE category_id=%s AND normalized_word=%s LIMIT 1",
                 (cat_id, normalize_word(word))
             ).fetchone()
 
@@ -5702,7 +6334,7 @@ def add_suggestion(user_id, user_name, word, category, description="", source="m
 
         pending = c.execute(
             """SELECT 1 FROM word_suggestions
-               WHERE category=? AND normalized_word=? 
+               WHERE category=%s AND normalized_word=%s
                AND status='pending' LIMIT 1""",
             (category, normalize_word(word))
         ).fetchone()
@@ -5715,7 +6347,7 @@ def add_suggestion(user_id, user_name, word, category, description="", source="m
                 user_id, user_name, word, normalized_word,
                 category, description, source, status, created_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, 'pending', ?)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'pending', %s)
         """, (
             user_id,
             user_name or "",
@@ -5737,7 +6369,7 @@ def pending_suggestions(limit=10):
             FROM word_suggestions
             WHERE status='pending'
             ORDER BY created_at ASC
-            LIMIT ?
+            LIMIT %s
         """, (limit,)).fetchall()
 
     return [dict(r) for r in rows]
@@ -5746,11 +6378,12 @@ def pending_suggestions(limit=10):
 def get_suggestion(sid):
     with conn() as c:
         r = c.execute(
-            "SELECT * FROM word_suggestions WHERE id=?",
+            "SELECT * FROM word_suggestions WHERE id=%s",
             (sid,)
         ).fetchone()
 
     return dict(r) if r else None
+
 
 def approve_suggestion(sid, admin_id, new_word=None, new_category=None):
     s = get_suggestion(sid)
@@ -5763,35 +6396,36 @@ def approve_suggestion(sid, admin_id, new_word=None, new_category=None):
     now = int(time.time())
 
     with conn() as c:
-        cat = c.execute("SELECT id FROM categories WHERE name=?", (category,)).fetchone()
+        cat = c.execute("SELECT id FROM categories WHERE name=%s", (category,)).fetchone()
         if not cat:
-            c.execute("INSERT INTO categories(name) VALUES (?)", (category,))
-            cat_id = c.execute("SELECT id FROM categories WHERE name=?", (category,)).fetchone()["id"]
+            c.execute("INSERT INTO categories(name) VALUES (%s)", (category,))
+            cat_id = c.execute("SELECT id FROM categories WHERE name=%s", (category,)).fetchone()["id"]
         else:
             cat_id = cat["id"]
 
-        dup = c.execute("SELECT 1 FROM words WHERE category_id=? AND normalized_word=? LIMIT 1",
+        dup = c.execute("SELECT 1 FROM words WHERE category_id=%s AND normalized_word=%s LIMIT 1",
                         (cat_id, nw)).fetchone()
         ok = False
         if not dup:
             try:
                 c.execute("""INSERT INTO words(category_id, word, normalized_word)
-                             VALUES (?,?,?)""", (cat_id, word, nw))
+                             VALUES (%s,%s,%s)""", (cat_id, word, nw))
                 ok = True
-            except sqlite3.IntegrityError:
+            except IntegrityError:
                 ok = False
 
         c.execute("""UPDATE word_suggestions
-                     SET status='approved', word=?, normalized_word=?, category=?,
-                         admin_id=?, reviewed_at=? WHERE id=?""",
+                     SET status='approved', word=%s, normalized_word=%s, category=%s,
+                         admin_id=%s, reviewed_at=%s WHERE id=%s""",
                   (word, nw, category, admin_id, now, sid))
-        c.execute("UPDATE players SET accepted_words=COALESCE(accepted_words,0)+1 WHERE user_id=?",
+        c.execute("UPDATE players SET accepted_words=COALESCE(accepted_words,0)+1 WHERE user_id=%s",
                   (s["user_id"],))
         c.execute("""INSERT INTO change_logs(admin_id, action, target_type, target_id, detail, created_at)
-                     VALUES (?, 'approve_suggestion', 'word_suggestion', ?, ?, ?)""",
+                     VALUES (%s, 'approve_suggestion', 'word_suggestion', %s, %s, %s)""",
                   (admin_id, str(sid), f"{word} -> {category}, inserted={ok}", now))
 
     return True, "پیشنهاد تأیید شد و کلمه به دیتابیس اضافه شد."
+
 
 def reject_suggestion(sid, admin_id, note=""):
     s = get_suggestion(sid)
@@ -5802,10 +6436,10 @@ def reject_suggestion(sid, admin_id, note=""):
         c.execute("""
             UPDATE word_suggestions
             SET status='rejected',
-                admin_id=?,
-                admin_note=?,
-                reviewed_at=?
-            WHERE id=?
+                admin_id=%s,
+                admin_note=%s,
+                reviewed_at=%s
+            WHERE id=%s
         """, (
             admin_id,
             note or "",
@@ -5815,7 +6449,7 @@ def reject_suggestion(sid, admin_id, note=""):
 
         c.execute("""
             INSERT INTO change_logs(admin_id, action, target_type, target_id, detail, created_at)
-            VALUES (?, 'reject_suggestion', 'word_suggestion', ?, ?, ?)
+            VALUES (%s, 'reject_suggestion', 'word_suggestion', %s, %s, %s)
         """, (
             admin_id,
             str(sid),
@@ -5838,12 +6472,12 @@ def edit_suggestion(sid, admin_id, word=None, category=None, description=None):
     with conn() as c:
         c.execute("""
             UPDATE word_suggestions
-            SET word=?,
-                normalized_word=?,
-                category=?,
-                description=?,
-                admin_id=?
-            WHERE id=?
+            SET word=%s,
+                normalized_word=%s,
+                category=%s,
+                description=%s,
+                admin_id=%s
+            WHERE id=%s
         """, (
             new_word,
             normalize_word(new_word),
@@ -5855,7 +6489,7 @@ def edit_suggestion(sid, admin_id, word=None, category=None, description=None):
 
         c.execute("""
             INSERT INTO change_logs(admin_id, action, target_type, target_id, detail, created_at)
-            VALUES (?, 'edit_suggestion', 'word_suggestion', ?, ?, ?)
+            VALUES (%s, 'edit_suggestion', 'word_suggestion', %s, %s, %s)
         """, (
             admin_id,
             str(sid),
@@ -5871,13 +6505,13 @@ def suggestion_stats_for_user(uid):
         total = c.execute("""
             SELECT COUNT(*) n
             FROM word_suggestions
-            WHERE user_id=?
+            WHERE user_id=%s
         """, (uid,)).fetchone()["n"]
 
         approved = c.execute("""
             SELECT COUNT(*) n
             FROM word_suggestions
-            WHERE user_id=? AND status='approved'
+            WHERE user_id=%s AND status='approved'
         """, (uid,)).fetchone()["n"]
 
     return {"total": total, "approved": approved}
@@ -5889,7 +6523,8 @@ def add_match_report(chat_id, mode, winner_id, players_count):
     with conn() as c:
         cur = c.execute("""
             INSERT INTO match_reports(chat_id, mode, winner_id, players, created_at)
-            VALUES (?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s)
+            RETURNING id
         """, (
             chat_id,
             mode,
@@ -5897,7 +6532,7 @@ def add_match_report(chat_id, mode, winner_id, players_count):
             players_count,
             int(time.time())
         ))
-        return cur.lastrowid
+        return cur.fetchone()["id"]
 
 
 def latest_match_reports(limit=10):
@@ -5906,7 +6541,7 @@ def latest_match_reports(limit=10):
             SELECT *
             FROM match_reports
             ORDER BY created_at DESC
-            LIMIT ?
+            LIMIT %s
         """, (limit,)).fetchall()
 
     return [dict(r) for r in rows]
@@ -5918,7 +6553,7 @@ def add_lucky_box(user_id, match_id, item_type, item_value, rarity):
     with conn() as c:
         c.execute("""
             INSERT INTO lucky_boxes(user_id, match_id, item_type, item_value, rarity, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (%s, %s, %s, %s, %s, %s)
         """, (
             user_id,
             match_id,
@@ -5933,21 +6568,22 @@ def add_lucky_box(user_id, match_id, item_type, item_value, rarity):
 
 def is_db_admin(uid):
     with conn() as c:
-        r = c.execute("SELECT 1 FROM admins WHERE user_id=?", (uid,)).fetchone()
+        r = c.execute("SELECT 1 FROM admins WHERE user_id=%s", (uid,)).fetchone()
     return r is not None
 
 
 def add_admin(uid, by):
     with conn() as c:
         c.execute("""
-        INSERT OR IGNORE INTO admins(user_id, added_by, added_at)
-        VALUES (?, ?, ?)
+        INSERT INTO admins(user_id, added_by, added_at)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (user_id) DO NOTHING
         """, (uid, by, int(time.time())))
 
 
 def del_admin(uid):
     with conn() as c:
-        cur = c.execute("DELETE FROM admins WHERE user_id=?", (uid,))
+        cur = c.execute("DELETE FROM admins WHERE user_id=%s", (uid,))
         return cur.rowcount > 0
 
 
@@ -5981,27 +6617,28 @@ def seed_namefamily_words(clean_extra_categories=True):
             rows = c.execute("SELECT name FROM categories").fetchall()
             for r in rows:
                 if r["name"] not in allowed:
-                    c.execute("DELETE FROM categories WHERE name=?", (r["name"],))
+                    c.execute("DELETE FROM categories WHERE name=%s", (r["name"],))
         for cat in NAMEFAMILY_ALLOWED_CATEGORIES:
-            c.execute("INSERT OR IGNORE INTO categories(name) VALUES (?)", (cat,))
-            cat_id = c.execute("SELECT id FROM categories WHERE name=?", (cat,)).fetchone()["id"]
+            c.execute("INSERT INTO categories(name) VALUES (%s) ON CONFLICT (name) DO NOTHING", (cat,))
+            cat_id = c.execute("SELECT id FROM categories WHERE name=%s", (cat,)).fetchone()["id"]
             for word in NAMEFAMILY_WORD_BANK.get(cat, []):
                 w = (word or "").strip()
                 if not w:
                     continue
                 nw = normalize_word(w)
-                exists = c.execute("SELECT 1 FROM words WHERE category_id=? AND normalized_word=? LIMIT 1", (cat_id, nw)).fetchone()
+                exists = c.execute("SELECT 1 FROM words WHERE category_id=%s AND normalized_word=%s LIMIT 1", (cat_id, nw)).fetchone()
                 if exists:
                     continue
                 c.execute("""
-                    INSERT OR IGNORE INTO words(category_id, word, normalized_word, difficulty, rarity, points)
-                    VALUES (?, ?, ?, 1, 1, 10)
+                    INSERT INTO words(category_id, word, normalized_word, difficulty, rarity, points)
+                    VALUES (%s, %s, %s, 1, 1, 10)
+                    ON CONFLICT (category_id, word) DO NOTHING
                 """, (cat_id, w, nw))
     return True
 
 
 # ---------- garden (delegation) ----------
-from core.garden_db import GardenAPI as _GardenAPI
+from core.garden_db import GardenAPI as _GardenAPI  # noqa: E402
 _garden = _GardenAPI(conn)
 
 def garden_ensure_starter(uid, name=""):        return _garden.ensure_starter(uid, name)
@@ -6018,6 +6655,7 @@ def garden_water_left(uid):                     return _garden.water_left(uid)
 def garden_water(uid, target_id):               return _garden.water(uid, target_id)
 def garden_public(uid):                         return _garden.public(uid)
 def garden_friend_gardens(uid, limit=8):        return _garden.friend_gardens(uid, limit)
+
 ```
 
 
@@ -6027,7 +6665,18 @@ FILE: core\garden_db.py
 
 ```py
 # -*- coding: utf-8 -*-
-"""لایه دیتابیس باغچه‌ی کلمو — کاملاً مستقل، فقط از conn() هسته استفاده می‌کند."""
+"""لایه دیتابیس باغچه‌ی کلمو — نسخه‌ی PostgreSQL.
+
+فقط از conn() هسته استفاده می‌کند. تمام امضاهای عمومی بدون تغییر مانده‌اند.
+
+تغییرات مهاجرت نسبت به نسخه‌ی SQLite:
+- executescript → execute (psycopg چند دستور در یک رشته را اجرا می‌کند).
+- placeholder «?» → «%s».
+- در UPSERT، ستون‌های جدول باید با نام جدول واجد شرایط شوند
+  (مثلاً garden_seeds.qty) چون در Postgres «qty» به‌تنهایی مبهم است.
+- AUTOINCREMENT وجود ندارد؛ این جدول‌ها کلید طبیعی دارند (نیازی نیست).
+- BIGINT برای user_id (آی‌دی‌های تلگرام بزرگ هستند).
+"""
 import random
 import time
 
@@ -6039,27 +6688,27 @@ HARVEST_AT = 100
 
 def init_garden(c):
     """جدول‌ها را می‌سازد. c یک اتصال باز از conn() است."""
-    c.executescript("""
+    c.execute("""
     CREATE TABLE IF NOT EXISTS garden_players (
-        user_id     INTEGER PRIMARY KEY,
+        user_id     BIGINT PRIMARY KEY,
         name        TEXT DEFAULT '',
         last_visit  TEXT DEFAULT '',
         water_day   TEXT DEFAULT '',
         water_used  INTEGER DEFAULT 0,
-        created_at  INTEGER
+        created_at  BIGINT
     );
     CREATE TABLE IF NOT EXISTS garden_trees (
-        user_id        INTEGER PRIMARY KEY,
+        user_id        BIGINT PRIMARY KEY,
         seed_type      TEXT DEFAULT 'کلمو',
         rarity         TEXT DEFAULT 'normal',
         growth         INTEGER DEFAULT 0,
         pending_coins  INTEGER DEFAULT 0,
         pending_xp     INTEGER DEFAULT 0,
         pending_boxes  INTEGER DEFAULT 0,
-        planted_at     INTEGER
+        planted_at     BIGINT
     );
     CREATE TABLE IF NOT EXISTS garden_seeds (
-        user_id    INTEGER,
+        user_id    BIGINT,
         seed_type  TEXT,
         qty        INTEGER DEFAULT 0,
         PRIMARY KEY (user_id, seed_type)
@@ -6085,37 +6734,40 @@ class GardenAPI:
     def ensure_starter(self, uid, name=""):
         with self._conn() as c:
             init_garden(c)
-            row = c.execute("SELECT 1 FROM garden_players WHERE user_id=?", (uid,)).fetchone()
+            row = c.execute("SELECT 1 FROM garden_players WHERE user_id=%s", (uid,)).fetchone()
             if not row:
-                c.execute("INSERT INTO garden_players(user_id, name, created_at) VALUES (?,?,?)",
+                c.execute("INSERT INTO garden_players(user_id, name, created_at) VALUES (%s,%s,%s) "
+                          "ON CONFLICT (user_id) DO NOTHING",
                           (uid, name or "", int(time.time())))
                 # بذر شروع
-                c.execute("""INSERT INTO garden_seeds(user_id, seed_type, qty) VALUES (?, 'کلمو', 1)
-                             ON CONFLICT(user_id, seed_type) DO UPDATE SET qty=qty+1""", (uid,))
+                c.execute("""INSERT INTO garden_seeds(user_id, seed_type, qty) VALUES (%s, 'کلمو', 1)
+                             ON CONFLICT(user_id, seed_type)
+                             DO UPDATE SET qty = garden_seeds.qty + 1""", (uid,))
             elif name:
-                c.execute("UPDATE garden_players SET name=? WHERE user_id=?", (name, uid))
+                c.execute("UPDATE garden_players SET name=%s WHERE user_id=%s", (name, uid))
 
     # ---- growth / seeds ----
     def add_growth(self, uid, amount, source="", detail=""):
         self.ensure_starter(uid)
         with self._conn() as c:
-            tree = c.execute("SELECT growth FROM garden_trees WHERE user_id=?", (uid,)).fetchone()
+            tree = c.execute("SELECT growth FROM garden_trees WHERE user_id=%s", (uid,)).fetchone()
             if not tree:
                 return  # درختی کاشته نشده
             new_growth = min(HARVEST_AT, int(tree["growth"]) + int(amount))
             grew = new_growth - int(tree["growth"])
             # هر واحد رشد → سکه/xp در انتظار برداشت
             c.execute("""UPDATE garden_trees
-                         SET growth=?, pending_coins=pending_coins+?, pending_xp=pending_xp+?
-                         WHERE user_id=?""",
+                         SET growth=%s, pending_coins=pending_coins+%s, pending_xp=pending_xp+%s
+                         WHERE user_id=%s""",
                       (new_growth, grew * 2, grew, uid))
 
     def add_seed(self, uid, seed_type=None, qty=1, source=""):
         self.ensure_starter(uid)
         st = seed_type or random_seed_type()
         with self._conn() as c:
-            c.execute("""INSERT INTO garden_seeds(user_id, seed_type, qty) VALUES (?,?,?)
-                         ON CONFLICT(user_id, seed_type) DO UPDATE SET qty=qty+?""",
+            c.execute("""INSERT INTO garden_seeds(user_id, seed_type, qty) VALUES (%s,%s,%s)
+                         ON CONFLICT(user_id, seed_type)
+                         DO UPDATE SET qty = garden_seeds.qty + %s""",
                       (uid, st, qty, qty))
         return st
 
@@ -6126,10 +6778,10 @@ class GardenAPI:
         self.ensure_starter(uid)
         today = _today()
         with self._conn() as c:
-            row = c.execute("SELECT last_visit FROM garden_players WHERE user_id=?", (uid,)).fetchone()
+            row = c.execute("SELECT last_visit FROM garden_players WHERE user_id=%s", (uid,)).fetchone()
             if row and row["last_visit"] == today:
                 return False
-            c.execute("UPDATE garden_players SET last_visit=? WHERE user_id=?", (today, uid))
+            c.execute("UPDATE garden_players SET last_visit=%s WHERE user_id=%s", (today, uid))
         self.add_growth(uid, 5, source="daily_visit")
         return True
 
@@ -6138,25 +6790,25 @@ class GardenAPI:
         self.ensure_starter(uid)
         with self._conn() as c:
             rows = c.execute("""SELECT seed_type, qty FROM garden_seeds
-                                WHERE user_id=? AND qty>0 ORDER BY seed_type""", (uid,)).fetchall()
+                                WHERE user_id=%s AND qty>0 ORDER BY seed_type""", (uid,)).fetchall()
         return [dict(r) for r in rows]
 
     def plant_seed(self, uid, seed_type):
         self.ensure_starter(uid)
         with self._conn() as c:
-            existing = c.execute("SELECT growth FROM garden_trees WHERE user_id=?", (uid,)).fetchone()
+            existing = c.execute("SELECT growth FROM garden_trees WHERE user_id=%s", (uid,)).fetchone()
             if existing and int(existing["growth"]) < HARVEST_AT:
                 return False, "یه درخت در حال رشد داری. اول برداشتش کن."
-            seed = c.execute("SELECT qty FROM garden_seeds WHERE user_id=? AND seed_type=?",
+            seed = c.execute("SELECT qty FROM garden_seeds WHERE user_id=%s AND seed_type=%s",
                              (uid, seed_type)).fetchone()
             if not seed or int(seed["qty"]) <= 0:
                 return False, "این بذر رو نداری."
-            c.execute("UPDATE garden_seeds SET qty=qty-1 WHERE user_id=? AND seed_type=?",
+            c.execute("UPDATE garden_seeds SET qty=qty-1 WHERE user_id=%s AND seed_type=%s",
                       (uid, seed_type))
             rarity = RARITY_BY_SEED.get(seed_type, "normal")
             c.execute("""INSERT INTO garden_trees(user_id, seed_type, rarity, growth,
                          pending_coins, pending_xp, pending_boxes, planted_at)
-                         VALUES (?,?,?,0,0,0,0,?)
+                         VALUES (%s,%s,%s,0,0,0,0,%s)
                          ON CONFLICT(user_id) DO UPDATE SET
                             seed_type=excluded.seed_type, rarity=excluded.rarity,
                             growth=0, pending_coins=0, pending_xp=0, pending_boxes=0,
@@ -6167,7 +6819,7 @@ class GardenAPI:
     def harvest(self, uid):
         self.ensure_starter(uid)
         with self._conn() as c:
-            tree = c.execute("SELECT * FROM garden_trees WHERE user_id=?", (uid,)).fetchone()
+            tree = c.execute("SELECT * FROM garden_trees WHERE user_id=%s", (uid,)).fetchone()
             if not tree:
                 return False, "درختی برای برداشت نداری.", None
             if int(tree["growth"]) < HARVEST_AT:
@@ -6176,20 +6828,21 @@ class GardenAPI:
             xp = int(tree["pending_xp"])
             boxes = int(tree["pending_boxes"])
             # جایزه به بازیکن اصلی (جدول players هسته)
-            p = c.execute("SELECT level, xp, coins FROM players WHERE user_id=?", (uid,)).fetchone()
+            p = c.execute("SELECT level, xp, coins FROM players WHERE user_id=%s", (uid,)).fetchone()
             if p:
                 from core.progression import add_xp
                 nl, nx, _ = add_xp(p["level"], p["xp"], xp)
-                c.execute("UPDATE players SET coins=?, level=?, xp=? WHERE user_id=?",
+                c.execute("UPDATE players SET coins=%s, level=%s, xp=%s WHERE user_id=%s",
                           (p["coins"] + coins, nl, nx, uid))
             # درخت برداشت شد → پاک
-            c.execute("DELETE FROM garden_trees WHERE user_id=?", (uid,))
+            c.execute("DELETE FROM garden_trees WHERE user_id=%s", (uid,))
             # شانس بذر جایزه
             reward_seed = None
             if random.random() < 0.4:
                 reward_seed = random_seed_type()
-                c.execute("""INSERT INTO garden_seeds(user_id, seed_type, qty) VALUES (?,?,1)
-                             ON CONFLICT(user_id, seed_type) DO UPDATE SET qty=qty+1""",
+                c.execute("""INSERT INTO garden_seeds(user_id, seed_type, qty) VALUES (%s,%s,1)
+                             ON CONFLICT(user_id, seed_type)
+                             DO UPDATE SET qty = garden_seeds.qty + 1""",
                           (uid, reward_seed))
         return True, "برداشت شد!", {"coins": coins, "xp": xp, "boxes": boxes, "seed": reward_seed}
 
@@ -6198,7 +6851,7 @@ class GardenAPI:
         self.ensure_starter(uid)
         today = _today()
         with self._conn() as c:
-            row = c.execute("SELECT water_day, water_used FROM garden_players WHERE user_id=?",
+            row = c.execute("SELECT water_day, water_used FROM garden_players WHERE user_id=%s",
                             (uid,)).fetchone()
             if not row or row["water_day"] != today:
                 return DAILY_WATER_QUOTA
@@ -6211,15 +6864,15 @@ class GardenAPI:
         self.ensure_starter(target_id)
         today = _today()
         with self._conn() as c:
-            row = c.execute("SELECT water_day, water_used FROM garden_players WHERE user_id=?",
+            row = c.execute("SELECT water_day, water_used FROM garden_players WHERE user_id=%s",
                             (uid,)).fetchone()
             used = int(row["water_used"]) if row and row["water_day"] == today else 0
             if used >= DAILY_WATER_QUOTA:
                 return False, "سهمیه‌ی آبیاری امروزت تموم شده."
-            tree = c.execute("SELECT growth FROM garden_trees WHERE user_id=?", (target_id,)).fetchone()
+            tree = c.execute("SELECT growth FROM garden_trees WHERE user_id=%s", (target_id,)).fetchone()
             if not tree:
                 return False, "این باغ درختی نداره."
-            c.execute("UPDATE garden_players SET water_day=?, water_used=? WHERE user_id=?",
+            c.execute("UPDATE garden_players SET water_day=%s, water_used=%s WHERE user_id=%s",
                       (today, used + 1, uid))
         self.add_growth(target_id, 3, source="friend_water")
         return True, "آبیاری شد 💧 (+۳٪ رشد)"
@@ -6228,9 +6881,9 @@ class GardenAPI:
     def public(self, uid):
         self.ensure_starter(uid)
         with self._conn() as c:
-            gp = c.execute("SELECT name FROM garden_players WHERE user_id=?", (uid,)).fetchone()
-            tree = c.execute("SELECT * FROM garden_trees WHERE user_id=?", (uid,)).fetchone()
-            seeds = c.execute("SELECT seed_type, qty FROM garden_seeds WHERE user_id=? AND qty>0",
+            gp = c.execute("SELECT name FROM garden_players WHERE user_id=%s", (uid,)).fetchone()
+            tree = c.execute("SELECT * FROM garden_trees WHERE user_id=%s", (uid,)).fetchone()
+            seeds = c.execute("SELECT seed_type, qty FROM garden_seeds WHERE user_id=%s AND qty>0",
                               (uid,)).fetchall()
         return {
             "name": (gp["name"] if gp and gp["name"] else f"کاربر {uid}"),
@@ -6247,10 +6900,11 @@ class GardenAPI:
                 FROM garden_trees t
                 LEFT JOIN players p ON p.user_id = t.user_id
                 LEFT JOIN garden_players gp ON gp.user_id = t.user_id
-                WHERE t.user_id <> ?
+                WHERE t.user_id <> %s
                 ORDER BY t.growth DESC
-                LIMIT ?""", (uid, limit)).fetchall()
+                LIMIT %s""", (uid, limit)).fetchall()
         return [dict(r) for r in rows]
+
 ```
 
 
@@ -6506,12 +7160,23 @@ FILE: features\lucky_box.py
 
 ```py
 # -*- coding: utf-8 -*-
-"""Lucky Box بعد از پایان مسابقه."""
+"""🎁 جعبه شانس بعد از پایان مسابقه.
 
+Phase 1: احتمال ظاهر شدن به‌طور محسوس کاهش یافت (۰٫۲۵ → ۰٫۱۰) و نام در همه‌جا
+از «Lucky Box» به «🎁 جعبه شانس» تغییر کرد.
+"""
+
+import logging
 import random
 from core import db, progression as pr
 
-DROP_CHANCE = 0.25
+logger = logging.getLogger("kalemo.luckybox")
+
+# نام نمایشی واحد برای استفاده در UI/پیام‌ها/لاگ‌ها.
+BOX_NAME = "🎁 جعبه شانس"
+
+# احتمال ظاهر شدن جعبه شانس بعد از هر مسابقه (به‌ازای هر بازیکن).
+DROP_CHANCE = 0.10
 
 ITEMS = [
     {"type": "coin", "value": 30, "rarity": "common", "weight": 40},
@@ -6531,33 +7196,38 @@ def _pick_item():
 
 
 def try_grant(uid, match_id=None):
-    if random.random() > DROP_CHANCE:
+    """با احتمال DROP_CHANCE یک جعبه شانس به بازیکن می‌دهد.
+
+    خطاها لاگ می‌شوند و None برمی‌گردد تا هرگز جریان پایان بازی را نشکنند.
+    """
+    try:
+        if random.random() > DROP_CHANCE:
+            return None
+
+        item = _pick_item()
+        p = db.get_player(uid)
+        if not p:
+            return None
+
+        if item["type"] == "coin":
+            db.save_player(uid, coins=p["coins"] + int(item["value"]))
+        elif item["type"] == "xp":
+            lvl, xp, _ = pr.add_xp(p["level"], p["xp"], int(item["value"]))
+            db.save_player(uid, level=lvl, xp=xp)
+
+        # title/badge/profile_frame/seed فعلاً فقط در جدول ذخیره می‌شوند.
+        db.add_lucky_box(
+            user_id=uid,
+            match_id=match_id,
+            item_type=item["type"],
+            item_value=item["value"],
+            rarity=item["rarity"],
+        )
+        logger.info("جعبه شانس به کاربر %s داده شد: %s", uid, item)
+        return item
+    except Exception:
+        logger.exception("خطا در اعطای جعبه شانس به کاربر %s", uid)
         return None
-
-    item = _pick_item()
-    p = db.get_player(uid)
-
-    if not p:
-        return None
-
-    if item["type"] == "coin":
-        db.save_player(uid, coins=p["coins"] + int(item["value"]))
-
-    elif item["type"] == "xp":
-        lvl, xp, _ = pr.add_xp(p["level"], p["xp"], int(item["value"]))
-        db.save_player(uid, level=lvl, xp=xp)
-
-    # title, badge, profile_frame, seed فعلاً فقط در lucky_boxes ذخیره می‌شوند
-    # (برای استفاده در سیستم‌های آینده مثل پروفایل/باغچه).
-    db.add_lucky_box(
-        user_id=uid,
-        match_id=match_id,
-        item_type=item["type"],
-        item_value=item["value"],
-        rarity=item["rarity"]
-    )
-
-    return item
 
 
 def item_text(item):
@@ -6935,6 +7605,14 @@ FILE: game\modes\blank.py
 """مود جای خالی (Enhanced Missing Letters).
 حذف هوشمند حروف با سختی پویا و جلوگیری از الگوی تکراری.
 نمونه‌ها: س-ب → سیب | در-ت → درخت | ک-امی-ن → کامیون
+
+نسخه‌ی Phase 1 (Beta) — رفع باگ‌ها:
+- باگ فریز/کرش: در نسخه‌ی قبلی `pool` فقط وقتی ساخته می‌شد که لیست کلمات
+  «خالی» بود؛ در نتیجه با وجود کلمه، `pool` تعریف‌نشده می‌ماند و
+  `NameError` رخ می‌داد (استثنای خاموش → فریز بازی). حالا `pool` همیشه
+  به‌درستی ساخته می‌شود.
+- حذف کد تکراری انتخاب کلمه (قبلاً منطق انتخاب دوبار کپی شده بود).
+- حلقه‌ی ضدتکرار محدود است (bounded) تا هرگز بی‌نهایت نشود.
 """
 import random
 from .base import BaseMode
@@ -6955,7 +7633,7 @@ class BlankMode(BaseMode):
     def __init__(self, words, ruleset=None, difficulty="normal", **kw):
         super().__init__(words, ruleset)
         self.difficulty = difficulty if difficulty in DIFFICULTY else "normal"
-        self._recent = []  # الگوهای اخیر برای ضدتکرار
+        self._recent = []  # کلمات اخیر برای ضدتکرار
 
     def tutorial(self):
         names = {"easy": "آسان", "normal": "معمولی", "hard": "سخت"}
@@ -6976,11 +7654,12 @@ class BlankMode(BaseMode):
             ratio = DIFFICULTY[self.difficulty]
             hide_count = max(1, min(n - 1, round(n * ratio)))
         positions = random.sample(range(n), k=hide_count)
-        out = []
         hidden = set(positions)
+        out = []
         i = 0
         while i < n:
             if i in hidden:
+                # چند حرف پشت‌سرهمِ حذف‌شده را با یک خط تیره نشان بده
                 while i < n and i in hidden:
                     i += 1
                 out.append(DASH)
@@ -6990,23 +7669,21 @@ class BlankMode(BaseMode):
         return "".join(out)
 
     def new_question(self):
-        if not self.words:
-            pool = [w for w in self.words if (w or "").strip()]
+        # pool همیشه از کلمات معتبر ساخته می‌شود (رفع باگ NameError).
+        pool = [w for w in self.words if (w or "").strip()]
         if not pool:
-            return {"prompt": "کلمه‌ای ثبت نشده 😅", "answer": None}
+            return {"prompt": "کلمه‌ای برای این دسته ثبت نشده 😅", "answer": None}
+
+        # ضدتکرار: تا چند تلاش، کلمه‌ای متفاوت از اخیرها انتخاب کن (حلقه‌ی محدود).
         word = random.choice(pool)
         for _ in range(8):
             if word not in self._recent:
                 break
             word = random.choice(pool)
-        # ضدتکرار: تا چند تلاش کلمه‌ای متفاوت از اخیرها انتخاب کن
-        word = random.choice(pool)
-        for _ in range(8):
-            if word not in self._recent:
-                break
-            word = random.choice(pool)
+
         masked = self._mask_word(word)
-        # اطمینان از این‌که الگو با دفعه قبل یکی نباشد
+        # اگر کلمه فقط یک حرف مؤثر داشت، ماسک ممکن است کل کلمه را نشان دهد؛
+        # در آن صورت هم مشکلی نیست چون بازیکن باید همان کلمه را بفرستد.
         self._recent = (self._recent + [word])[-5:]
         return {
             "prompt": f"🧩 کلمه رو کامل کن:\n\n<code>{masked}</code>",
@@ -7020,6 +7697,7 @@ class BlankMode(BaseMode):
         if self.norm(text) == self.norm(ans):
             return True, None
         return False, "غلط"
+
 ```
 
 
@@ -7464,6 +8142,86 @@ class VariableMode(BaseMode):
 
 
 ================================================================================
+FILE: game\ranking.py
+================================================================================
+
+```py
+# -*- coding: utf-8 -*-
+"""رتبه‌بندی مرکزی و واحد کلمو (Single Source of Truth).
+
+هدف: حذف منطق تکراریِ مرتب‌سازی که در چند جا پراکنده بود و باعث باگ رتبه‌بندی
+(نمایش بازیکن با امتیاز صفر بالاتر از بازیکن با امتیاز بیشتر) می‌شد.
+
+قوانین مرتب‌سازی قطعی (deterministic tie-break):
+1. امتیاز بیشتر (score) — نزولی
+2. برد بیشتر (wins) — نزولی
+3. ثبت‌نام زودتر / user_id کوچک‌تر — صعودی
+
+هر جای پروژه که رتبه‌بندی می‌خواهد، فقط از این ماژول استفاده می‌کند.
+"""
+
+
+def rank_key(score=0, wins=0, uid=0):
+    """کلید مرتب‌سازی قطعی. با sort(key=..., reverse=True) استفاده نکنید؛
+    این کلید طوری ساخته شده که خودش «هرچه بزرگ‌تر = رتبه بهتر» را رعایت کند
+    و user_id کوچک‌تر (ثبت زودتر) در تساوی برنده باشد.
+    """
+    # user_id را منفی می‌کنیم تا در حالت نزولی، uid کوچک‌تر بالاتر بیاید.
+    return (int(score or 0), int(wins or 0), -int(uid or 0))
+
+
+def sort_players(players):
+    """players: dict یا list از (uid, info) که info شامل score و اختیاری wins است.
+
+    خروجی: list مرتب‌شده‌ی (uid, info) به‌صورت نزولی و قطعی.
+    """
+    items = players.items() if isinstance(players, dict) else list(players)
+    return sorted(
+        items,
+        key=lambda kv: rank_key(
+            score=kv[1].get("score", 0),
+            wins=kv[1].get("wins", 0),
+            uid=kv[0],
+        ),
+        reverse=True,
+    )
+
+
+def sort_rows(rows, score_getter, wins_getter=None, id_getter=None):
+    """مرتب‌سازی عمومی برای ردیف‌های دلخواه (مثلاً خروجی SQL).
+
+    rows: iterable
+    score_getter/wins_getter/id_getter: توابعی که از هر ردیف مقدار را می‌گیرند.
+    """
+    def key(r):
+        return rank_key(
+            score=score_getter(r),
+            wins=wins_getter(r) if wins_getter else 0,
+            uid=id_getter(r) if id_getter else 0,
+        )
+    return sorted(rows, key=key, reverse=True)
+
+
+def assert_sorted(ranked, score_getter):
+    """اعتبارسنجی خودکار: مطمئن می‌شود لیست واقعاً نزولی مرتب شده است.
+
+    اگر جایی امتیاز پایین‌تر بالاتر از امتیاز بالاتر باشد، AssertionError می‌دهد.
+    این تابع قبل از ارسال هر لیدربورد صدا زده می‌شود تا باگ رتبه هرگز به کاربر نرسد.
+    """
+    prev = None
+    for i, item in enumerate(ranked):
+        cur = int(score_getter(item) or 0)
+        if prev is not None and cur > prev:
+            raise AssertionError(
+                f"Leaderboard not sorted: index {i} score {cur} > previous {prev}"
+            )
+        prev = cur
+    return True
+
+```
+
+
+================================================================================
 FILE: game\rules.py
 ================================================================================
 
@@ -7618,11 +8376,15 @@ FILE: game\session.py
 """Game Session مستقل + Join System + تنظیمات لابی + سیستم زمان.
 وضعیت هر گروه در حافظه نگه‌داری می‌شود (یک بازی فعال در هر گروه).
 حالت‌ها: lobby -> countdown -> tutorial -> running -> ended
+
+نسخه‌ی Phase 1 (Beta): اصلاحات پایداری تایمر، ضدتکرار سوال، قفل پایان،
+و رتبه‌بندی قطعی از طریق game.ranking.
 """
 import time
 from game.rules import RuleSet
 from game.modes import get_mode_class, mode_meta
 from core.normalize import normalize_word
+from game import ranking
 
 # گزینه‌های زمان مسابقه (ثانیه) — 0 یعنی نامحدود
 TIME_OPTIONS = [
@@ -7638,6 +8400,10 @@ DIFFICULTY_OPTIONS = [
     ("normal", "معمولی"),
     ("hard",   "سخت"),
 ]
+
+# مودهایی که «رد کردن خودکار پس از بی‌پاسخی» ندارند.
+NO_AUTOSKIP_MODES = {"classic_random", "classic_choice", "namefamily"}
+AUTOSKIP_SECONDS = 20
 
 
 def time_label(seconds):
@@ -7667,7 +8433,7 @@ class Session:
         self.words = []
         self.mode = None
         self.question = None
-        self.used = set()
+        self.used = set()                  # کلمات پذیرفته‌شده‌ی همین دور (ضدتکرار پاسخ)
         self.focus_mode = False
         self.panel_msg_id = None
         # ---- سیستم زمان ----
@@ -7676,22 +8442,28 @@ class Session:
         self.deadline = None
         # ---- سختی (برای جای خالی) ----
         self.difficulty = "normal"
-        # ---- وظیفه زمان‌بندی اتمام خودکار ----
+        # ---- وظیفه زمان‌بندی اتمام خودکار + وظیفه استاتوس دوره‌ای ----
         self.timer_task = None
+        self.status_task = None
         # ---- شناسه پیام زنده‌ی بازی ----
         self.live_msg_id = None
         self.correct_total = 0
         self.wrong_total = 0
         self.correct_by_user = {}
         self.wrong_by_user = {}
-        self.warns = {}
-        self.warns = {}   # uid -> تعداد اخطار در همین بازی
+        self.warns = {}                    # uid -> تعداد اخطار در همین بازی
+        # ---- قفل پایان: جلوگیری از رویداد پایان تکراری (race condition) ----
+        self.finishing = False
+        # ---- تاریخچه‌ی سوالات: هر سوال فقط یک‌بار تا اتمام همه ----
+        self.question_history = set()
+        # ---- زمان آخرین فعالیت پاسخ (برای autoskip) ----
+        self.last_answer_at = None
 
     def add_warn(self, uid):
         """یک اخطار اضافه می‌کند و تعداد کل اخطارهای کاربر را برمی‌گرداند."""
         self.warns[uid] = self.warns.get(uid, 0) + 1
         return self.warns[uid]
-    
+
     # ---- Join System ----
     def join(self, uid, name):
         if self.state != "lobby":
@@ -7722,6 +8494,7 @@ class Session:
         self.mode = None
         self.question = None
         self.used = set()
+        self.question_history = set()
         self.ruleset.rules = []
         return True
 
@@ -7731,6 +8504,10 @@ class Session:
     def is_round_based(self):
         """مودهایی که به‌جای سوال پیاپی، یک دور جمعی دارند (مثل اسم‌وفامیل)."""
         return self.mode_id == "namefamily"
+
+    def autoskip_enabled(self):
+        """آیا این مود پس از ۲۰ثانیه بی‌پاسخی باید خودکار رد شود؟"""
+        return self.mode_id not in NO_AUTOSKIP_MODES
 
     def build_mode(self):
         cls = get_mode_class(self.mode_id)
@@ -7743,22 +8520,47 @@ class Session:
         return self.mode
 
     # ---- gameplay ----
+    def _question_signature(self, q):
+        """امضای یکتا برای یک سوال، جهت جلوگیری از تکرار در یک مسابقه."""
+        if not isinstance(q, dict):
+            return str(q)
+        # از prompt به‌عنوان امضا استفاده می‌کنیم (در همه‌ی مودها یکتا و پایدار است).
+        return q.get("prompt") or repr(sorted(q.get("answers", [])))
+
     def next_question(self):
-        self.question = self.mode.new_question()
-        return self.question
+        """سوال بعدی را می‌سازد و از تکرار در همین مسابقه جلوگیری می‌کند.
+
+        باگ قبلی: بعضی مودها ممکن بود سوال تکراری تولید کنند یا در تلاش برای
+        اجتناب از تکرار وارد حلقه‌ی بی‌نهایت شوند. اینجا سقف تلاش (bounded loop)
+        گذاشته شده تا هرگز فریز نشود؛ اگر همه‌ی سوالات تمام شدند، تاریخچه ریست
+        می‌شود تا بازی ادامه یابد.
+        """
+        MAX_TRIES = 12
+        q = None
+        for _ in range(MAX_TRIES):
+            q = self.mode.new_question()
+            sig = self._question_signature(q)
+            if sig not in self.question_history:
+                self.question_history.add(sig)
+                self.question = q
+                return q
+        # همه‌ی سوالات (تا این‌جا) دیده شده‌اند → تاریخچه را پاک کن و ادامه بده.
+        self.question_history.clear()
+        if q is not None:
+            self.question_history.add(self._question_signature(q))
+        self.question = q
+        return q
 
     def submit(self, uid, name, text):
         if self.state != "running" or not self.question:
             return None
-        from core.normalize import normalize_word
         w = text.strip()
         nw = normalize_word(w)
         if uid not in self.players:
             self.players[uid] = {"name": name, "score": 0}
         if nw in self.used:
-            self.wrong_total += 1
-            self.wrong_by_user[uid] = self.wrong_by_user.get(uid, 0) + 1
-            return {"ok": False, "reason": "تکراری"}
+            # کلمه‌ی تکراری در همین دور — بدون کسر امتیاز، فقط علامت‌گذاری می‌شود.
+            return {"ok": False, "reason": "duplicate"}
         ok, reason = self.mode.check_answer(self.question, w)
         if not ok:
             self.wrong_total += 1
@@ -7767,6 +8569,7 @@ class Session:
         self.used.add(nw)
         self.correct_total += 1
         self.correct_by_user[uid] = self.correct_by_user.get(uid, 0) + 1
+        self.last_answer_at = time.time()
         pts = 10
         if self.ruleset.is_active("bonus"):
             pts += 5
@@ -7776,9 +8579,9 @@ class Session:
             "points": pts,
             "score": self.players[uid]["score"],
             "found": len(self.used),
-            "total": len({normalize_word(w) for w in self.words})
+            "total": len({normalize_word(x) for x in self.words})
         }
-    
+
     def progress(self):
         total = len({
             normalize_word(w)
@@ -7788,20 +8591,14 @@ class Session:
         found = len(self.used)
         return found, total
 
-
     def is_completed(self):
         found, total = self.progress()
         return total > 0 and found >= total
 
-
-    def add_warn(self, uid):
-        self.warns[uid] = self.warns.get(uid, 0) + 1
-        return self.warns[uid]
-
-
     # ---- زمان ----
     def start_timer(self):
         self.started_at = time.time()
+        self.last_answer_at = self.started_at
         if self.time_limit > 0:
             self.deadline = self.started_at + self.time_limit
         else:
@@ -7826,7 +8623,12 @@ class Session:
         return None
 
     def ranking(self):
-        return sorted(self.players.items(), key=lambda kv: kv[1]["score"], reverse=True)
+        """رتبه‌بندی قطعی از طریق game.ranking (منبع واحد حقیقت).
+
+        باگ قبلی: مرتب‌سازی صرفاً بر اساس score بود و در تساوی نتیجه‌ی
+        غیرقطعی می‌داد. حالا tie-break با user_id قطعی است.
+        """
+        return ranking.sort_players(self.players)
 
 
 # ---- رجیستری session‌های فعال ----
@@ -7848,12 +8650,15 @@ def create(chat_id, host_id, host_name, mode_id="classic_random"):
     return s
 
 def remove(chat_id):
+    """session را حذف می‌کند و همه‌ی taskهای پس‌زمینه را امن لغو می‌کند."""
     s = _sessions.pop(chat_id, None)
-    if s and s.timer_task:
-        try:
-            s.timer_task.cancel()
-        except Exception:
-            pass
+    if s:
+        for task in (s.timer_task, s.status_task):
+            if task:
+                try:
+                    task.cancel()
+                except Exception:
+                    pass
     return s
 
 ```
@@ -8534,11 +9339,27 @@ FILE: handlers\lobby.py
 همه با EditMessage.
 
 اسم‌وفامیل: پاسخ‌ها فقط در PV ثبت می‌شوند (handlers/namefamily_private.py).
-پایان مسابقه: گزارش مسابقه ثبت می‌شود و احتمال Lucky Box برای بازیکنان بررسی می‌شود.
+پایان مسابقه: گزارش مسابقه ثبت می‌شود و احتمال «🎁 جعبه شانس» بررسی می‌شود.
+
+نسخه‌ی Phase 1 (Beta) — رفع باگ‌ها:
+- تایمر روی صفر فریز نمی‌شود (remaining هرگز منفی نیست) و در پایان زمان،
+  بازی به‌طور قطعی تمام می‌شود.
+- auto-skip: در مودهای سوال‌محور (به‌جز کلاسیک و اسم‌وفامیل) اگر ۲۰ ثانیه
+  هیچ پاسخ درستی نیاید، سوال به‌طور خودکار رد و سوال بعدی نمایش داده می‌شود.
+- پیام وضعیت دوره‌ای هر ۳۰ ثانیه (status_task) برای زنده نگه‌داشتن مسابقه.
+- خطاهای تسک‌های پس‌زمینه دیگر خاموش نیستند و لاگ می‌شوند.
+- قفل پایان (s.finishing) از اجرای دوباره‌ی پایان (race condition) جلوگیری می‌کند.
+- سازگاری با session.submit جدید (کلیدهای points/found/total) و پاسخ تکراری.
+- «Lucky Box» → «🎁 جعبه شانس».
 """
 import asyncio
+import html
+import logging
 import re
-from telegram import Update
+import time
+from datetime import timedelta
+
+from telegram import Update, ChatPermissions
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
 
@@ -8546,24 +9367,23 @@ from core import db
 from features import player_service as svc
 from game import session as sess
 from ui import panels, persona
-import html
-import time
 
 HTML = ParseMode.HTML
-
-import time
-from datetime import timedelta
-from telegram import ChatPermissions
+log = logging.getLogger(__name__)
 
 MAX_WARNS = 3                 # سقف اخطار قبل از سکوت
 MUTE_SECONDS = 5 * 60         # مدت سکوت: ۵ دقیقه
 FOCUS_WORD_LIMIT = 3          # بیش از این تعداد کلمه = پیام جمله‌ای
+STATUS_INTERVAL = 30          # فاصله‌ی پیام وضعیت دوره‌ای (ثانیه)
+LIVE_REFRESH = 10            # فاصله‌ی رفرش پیام زنده (ثانیه)
+
 
 def _arg(parts, i):
     try:
         return parts[i]
     except IndexError:
         return None
+
 
 # عبارت‌های متنی که بازی را شروع می‌کنند (بدون اسلش)
 START_PATTERNS = [r"^شروع\s+کلمو$", r"^شروع\s+بازی$", r"^کلمو$"]
@@ -8631,6 +9451,7 @@ async def cmd_endgame(update, ctx):
             "⛔️ فقط سازنده‌ی بازی یا ادمین‌های گروه می‌تونن بازی رو تموم کنن.")
     await _finish(ctx, chat.id)
 
+
 async def cmd_settings(update, ctx):
     chat = update.effective_chat
     if chat.type == "private":
@@ -8667,10 +9488,7 @@ async def _safe_delete(msg):
 
 
 async def _warn_and_maybe_mute(ctx, s, chat_id, u, reason_text):
-    """
-    یک اخطار ثبت می‌کند؛ در اخطار سوم کاربر را ۵ دقیقه سکوت می‌کند.
-    یک پیام کوتاه (خوداتخریب) در گروه می‌فرستد.
-    """
+    """یک اخطار ثبت می‌کند؛ در اخطار سوم کاربر را ۵ دقیقه سکوت می‌کند."""
     n = s.add_warn(u.id)
     name = u.first_name or "کاربر"
 
@@ -8685,7 +9503,6 @@ async def _warn_and_maybe_mute(ctx, s, chat_id, u, reason_text):
             muted = True
         except Exception:
             muted = False
-        # اخطارها را برای شروع دوباره صفر کن تا بعد از سکوت از نو شمرده شود
         s.warns[u.id] = 0
         if muted:
             txt = (f"🔇 <a href=\"tg://user?id={u.id}\">{name}</a> "
@@ -8700,22 +9517,23 @@ async def _warn_and_maybe_mute(ctx, s, chat_id, u, reason_text):
 
     try:
         note = await ctx.bot.send_message(chat_id, txt, parse_mode=HTML)
-        # پیام هشدار را بعد از ۵ ثانیه پاک کن تا گروه شلوغ نشود
         ctx.job_queue.run_once(
             lambda c: c.bot.delete_message(chat_id, note.message_id),
             5, name=f"delwarn:{chat_id}:{note.message_id}")
     except Exception:
-        pass
+        log.exception("ارسال/زمان‌بندی حذف پیام اخطار شکست خورد")
+
 
 # ---------- بررسی دسترسی سازنده ----------
 def _host_only(s, uid):
     return uid == s.host_id
 
 
-
 HOST_ACTIONS = {"mode", "setmode", "rules", "toggle", "time", "settime",
                 "diff", "setdiff", "cat", "catpage", "setcat",
                 "start", "cancel", "focus", "end"}
+
+
 # ---------- callbackها ----------
 async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
@@ -8758,36 +9576,28 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return await q.answer("مود نامعتبر است.", show_alert=True)
         await q.answer(f"مود شد: {s.mode_name()}")
         return await _refresh_lobby(q, s)
-    
+
     if action == "cat":
         cats = db.list_categories()
         await q.answer()
         return await q.message.edit_text(
-            panels.category_text(),
-            parse_mode=HTML,
-            reply_markup=panels.category_kb(cats, s.category),
-        )
+            panels.category_text(), parse_mode=HTML,
+            reply_markup=panels.category_kb(cats, s.category))
 
     if action == "catpage":
         page = int(_arg(parts, 2) or 0)
         cats = db.list_categories()
         await q.answer()
         return await q.message.edit_text(
-            panels.category_text(),
-            parse_mode=HTML,
-            reply_markup=panels.category_kb(cats, s.category, page=page),
-        )    
+            panels.category_text(), parse_mode=HTML,
+            reply_markup=panels.category_kb(cats, s.category, page=page))
 
     if action == "setcat":
-        page = int(_arg(parts, 2) or 0)
         cat = ":".join(parts[3:]).strip()
-
         if not cat or not db.get_category(cat):
             return await q.answer("دسته نامعتبر است.", show_alert=True)
-
         s.category = cat
         s.words = db.list_words(cat) or []
-
         await q.answer("دسته انتخاب شد.")
         return await _refresh_lobby(q, s)
 
@@ -8831,7 +9641,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             s.ruleset.toggle(rid)
         await q.answer()
         return await q.message.edit_text(panels.rules_text(), parse_mode=HTML,
-                                        reply_markup=panels.rules_kb(s))
+                                         reply_markup=panels.rules_kb(s))
 
     if action == "focus":
         s.focus_mode = not s.focus_mode
@@ -8852,10 +9662,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         if s.count() < 2:
             return await q.answer("حداقل دو بازیکن برای شروع لازم است.", show_alert=True)
         if not _load_category_for_session(s):
-            return await q.answer(
-                "برای این مود دسته/کلمه کافی نیست.",
-                show_alert=True,
-            )
+            return await q.answer("برای این مود دسته/کلمه کافی نیست.", show_alert=True)
         await q.answer()
         return await _start_countdown(q, ctx, s)
 
@@ -8865,6 +9672,7 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 "فقط سازنده یا ادمین گروه می‌تونه پایان بده.", show_alert=True)
         await q.answer()
         return await _finish(ctx, chat_id)
+
 
 async def _refresh_lobby(q, s):
     try:
@@ -8883,10 +9691,7 @@ async def _start_countdown(q, ctx, s):
     if mentions:
         try:
             await ctx.bot.send_message(
-                s.chat_id,
-                "شروع مسابقه:\n" + mentions,
-                parse_mode=HTML,
-            )
+                s.chat_id, "شروع مسابقه:\n" + mentions, parse_mode=HTML)
         except Exception:
             pass
     s.live_msg_id = msg.message_id
@@ -8922,15 +9727,18 @@ async def _start_countdown(q, ctx, s):
         from handlers import namefamily_private as nf
         await nf.start_group_namefamily(ctx, s)
 
-    # زمان‌بند اتمام خودکار + رفرش زنده
+    # زمان‌بند اتمام خودکار/auto-skip + پیام وضعیت دوره‌ای
     s.timer_task = asyncio.create_task(_run_loop(ctx, s))
+    s.status_task = asyncio.create_task(_status_loop(ctx, s))
 
 
 async def _run_loop(ctx, s):
-    """تا پایان زمان، پیام زنده را به‌روزرسانی می‌کند و سپس بازی را تمام می‌کند.
+    """حلقه‌ی اصلی بازی: هر ثانیه بررسی می‌کند.
 
-    برای اسم‌وفامیل هم تایمر قانون بازی ملاک است؛ کامل‌کردن فرم فقط یک شمارش
-    معکوس کوتاه‌تر ایجاد می‌کند، اما پایان بازی وابسته به تکمیل همه پاسخ‌ها نیست.
+    - اگر زمان تمام شد → بازی را تمام می‌کند (تایمر روی صفر فریز نمی‌شود).
+    - auto-skip: اگر مود واجد شرایط باشد و ۲۰ ثانیه هیچ پاسخ درستی نیاید،
+      سوال رد و سوال بعدی نمایش داده می‌شود.
+    - پیام زنده هر LIVE_REFRESH ثانیه به‌روزرسانی می‌شود.
     """
     try:
         while True:
@@ -8938,16 +9746,69 @@ async def _run_loop(ctx, s):
             cur = sess.get(s.chat_id)
             if not cur or cur is not s or s.state != "running":
                 return
+
             rem = s.remaining()
             if rem is not None and rem <= 0:
                 await _finish(ctx, s.chat_id, reason="time")
                 return
-            if rem is None or int(rem) % 10 == 0:
+
+            # auto-skip برای مودهای سوال‌محورِ واجد شرایط
+            if s.autoskip_enabled() and not s.is_round_based():
+                last = s.last_answer_at or s.started_at or time.time()
+                if time.time() - last >= sess.AUTOSKIP_SECONDS:
+                    await _autoskip(ctx, s)
+
+            # رفرش پیام زنده
+            if rem is None or int(rem) % LIVE_REFRESH == 0:
                 await _update_live(ctx, s)
     except asyncio.CancelledError:
         return
     except Exception:
+        log.exception("خطای غیرمنتظره در حلقه‌ی بازی (chat_id=%s)", s.chat_id)
+
+
+async def _autoskip(ctx, s):
+    """سوال فعلی را رد می‌کند و سوال بعدی را نمایش می‌دهد."""
+    try:
+        prev = s.question.get("prompt") if isinstance(s.question, dict) else None
+        s.next_question()
+        s.last_answer_at = time.time()   # تایمر auto-skip را ریست کن
+        # اگر واقعاً سوال عوض شد، اطلاع بده
+        cur = s.question.get("prompt") if isinstance(s.question, dict) else None
+        if cur != prev:
+            try:
+                await ctx.bot.send_message(
+                    s.chat_id, "⏭ کسی جواب نداد؛ سوال بعدی!", parse_mode=HTML)
+            except Exception:
+                pass
+        await _update_live(ctx, s)
+    except Exception:
+        log.exception("خطا در auto-skip (chat_id=%s)", s.chat_id)
+
+
+async def _status_loop(ctx, s):
+    """هر STATUS_INTERVAL ثانیه یک پیام وضعیت کوتاه در گروه می‌فرستد تا مسابقه
+    زنده و قابل‌دنبال‌کردن بماند (به‌ویژه در گروه‌های شلوغ)."""
+    try:
+        while True:
+            await asyncio.sleep(STATUS_INTERVAL)
+            cur = sess.get(s.chat_id)
+            if not cur or cur is not s or s.state != "running":
+                return
+            leader = s.leader()
+            leader_line = (f"🥇 صدرنشین: <b>{leader[0]}</b> — {leader[1]} امتیاز"
+                           if leader else "🥇 هنوز کسی امتیاز نگرفته")
+            try:
+                await ctx.bot.send_message(
+                    s.chat_id,
+                    f"⏱ باقی‌مانده: <b>{s.remaining_label()}</b>\n{leader_line}",
+                    parse_mode=HTML)
+            except Exception:
+                pass
+    except asyncio.CancelledError:
         return
+    except Exception:
+        log.exception("خطای غیرمنتظره در حلقه‌ی وضعیت (chat_id=%s)", s.chat_id)
 
 
 async def _update_live(ctx, s):
@@ -8959,11 +9820,18 @@ async def _update_live(ctx, s):
             text=panels.live_text(s), parse_mode=HTML,
             reply_markup=panels.running_kb(s))
     except Exception:
+        # خطای «message is not modified» عادی است؛ لاگ نمی‌کنیم.
         pass
 
 
 # ---------- پایان ----------
 async def _finish(ctx, chat_id, reason=None):
+    # قفل پایان: از اجرای هم‌زمان/دوباره جلوگیری می‌کند (race condition).
+    s = sess.get(chat_id)
+    if not s or getattr(s, "finishing", False):
+        return
+    s.finishing = True
+
     s = sess.remove(chat_id)
     if not s:
         return
@@ -8973,21 +9841,16 @@ async def _finish(ctx, chat_id, reason=None):
     # ---- مود اسم‌وفامیل ----
     if s.mode_id == "namefamily" and s.mode:
         s.mode.lock()
-
         evaluated = s.mode.evaluate(s.players)
 
-        # پاسخ‌های نامعتبر را وارد صف پیشنهاد کن
         for uid, data in evaluated.items():
             for cell in data["cells"]:
                 if cell["status"] == "❌" and cell["answer"] != "—":
                     db.add_suggestion(
-                        user_id=uid,
-                        user_name=data["name"],
-                        word=cell["answer"],
-                        category=cell["cat"],
+                        user_id=uid, user_name=data["name"],
+                        word=cell["answer"], category=cell["cat"],
                         description="پیشنهاد خودکار از پاسخ نامعتبر اسم‌وفامیل",
-                        source="namefamily"
-                    )
+                        source="namefamily")
 
         for uid, data in evaluated.items():
             if uid in s.players:
@@ -8995,69 +9858,50 @@ async def _finish(ctx, chat_id, reason=None):
 
         ranking = s.ranking()
         winner = ranking[0][0] if ranking and ranking[0][1]["score"] > 0 else None
-
         for uid, info in ranking:
-            svc.record_game(
-                uid,
-                info["name"],
-                won=(uid == winner),
-                score=info["score"]
-            )
+            svc.record_game(uid, info["name"], won=(uid == winner), score=info["score"])
 
         match_id = db.add_match_report(
-            chat_id=chat_id,
-            mode=s.mode_name(),
-            winner_id=winner,
-            players_count=len(ranking)
-        )
+            chat_id=chat_id, mode=s.mode_name(),
+            winner_id=winner, players_count=len(ranking))
 
-        box_lines = []
-        for uid, info in ranking:
-            item = lucky_box.try_grant(uid, match_id=match_id)
-            if item:
-                box_lines.append(
-                    f"🎁 <b>{info['name']}</b> یک Lucky Box گرفت: {lucky_box.item_text(item)}"
-                )
-
+        box_lines = _grant_boxes(lucky_box, ranking, match_id)
         text = s.mode.result_text(s.players)
         if box_lines:
-            text += "\n\n🎁 <b>Lucky Box</b>\n" + "\n".join(box_lines)
-
-        # طبق درخواست: پیام جدید ارسال می‌شود، پیام اصلی بازی Edit نمی‌شود.
+            text += "\n\n🎁 <b>جعبه شانس</b>\n" + "\n".join(box_lines)
         await ctx.bot.send_message(chat_id, text, parse_mode=HTML)
         return
 
     # ---- بقیه مودها ----
     ranking = s.ranking()
-    medals = ["🥇", "🥈", "🥉"]
-    lines = []
-    for i, (uid, info) in enumerate(ranking):
-        badge = medals[i] if i < 3 else f"{i+1}."
-        lines.append(f"{badge} <b>{info['name']}</b> — {info['score']} امتیاز")
     winner = ranking[0][0] if ranking and ranking[0][1]["score"] > 0 else None
     for uid, info in ranking:
         svc.record_game(uid, info["name"], won=(uid == winner), score=info["score"])
 
     match_id = db.add_match_report(
-        chat_id=chat_id,
-        mode=s.mode_name(),
-        winner_id=winner,
-        players_count=len(ranking)
-    )
+        chat_id=chat_id, mode=s.mode_name(),
+        winner_id=winner, players_count=len(ranking))
 
+    box_lines = _grant_boxes(lucky_box, ranking, match_id)
+    text = panels.finish_text(s, reason=reason)
+    if box_lines:
+        text += "\n\n🎁 <b>جعبه شانس</b>\n" + "\n".join(box_lines)
+    await ctx.bot.send_message(chat_id, text, parse_mode=HTML)
+
+
+def _grant_boxes(lucky_box, ranking, match_id):
+    """برای هر بازیکن شانس «🎁 جعبه شانس» را بررسی می‌کند و خطوط نمایش می‌سازد."""
     box_lines = []
     for uid, info in ranking:
-        item = lucky_box.try_grant(uid, match_id=match_id)
+        try:
+            item = lucky_box.try_grant(uid, match_id=match_id)
+        except Exception:
+            log.exception("خطا در اعطای جعبه شانس به کاربر %s", uid)
+            continue
         if item:
             box_lines.append(
-                f"🎁 <b>{info['name']}</b> یک Lucky Box گرفت: {lucky_box.item_text(item)}"
-            )
-
-    text = panels.finish_text(s, reason=reason) 
-    if box_lines:
-        text += "\n\n🎁 <b>Lucky Box</b>\n" + "\n".join(box_lines)
-
-    await ctx.bot.send_message(chat_id, text, parse_mode=HTML)
+                f"🎁 <b>{info['name']}</b> یک جعبه شانس گرفت: {lucky_box.item_text(item)}")
+    return box_lines
 
 
 # ---------- پیام‌های گروه هنگام بازی ----------
@@ -9083,16 +9927,14 @@ async def on_group_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # --- مودهای سوال‌محور ---
     res = s.submit(u.id, nm, text)
-    if res and res["ok"]:
-        found, total = s.progress()
 
-        await msg.reply_text(
-            panels.answer_ok_text(
-                res["score"],
-                found,
-                total,
-            )
-        )
+    if res and res.get("ok"):
+        found = res.get("found")
+        total = res.get("total")
+        if found is None or total is None:
+            found, total = s.progress()
+
+        await msg.reply_text(panels.answer_ok_text(res["score"], found, total))
 
         if s.is_completed():
             await _finish(ctx, chat.id, reason="completed")
@@ -9100,10 +9942,19 @@ async def on_group_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
         s.next_question()
         await _update_live(ctx, s)
-
-
         return True
+
+    # پاسخ تکراری: فقط یک تذکر کوتاه، بدون کسر امتیاز.
+    if res and res.get("reason") == "duplicate":
+        try:
+            await msg.reply_text("♻️ این کلمه قبلاً گفته شده!")
+        except Exception:
+            pass
+        return True
+
+    # پاسخ اشتباه یا نامرتبط → حالت تمرکز را بررسی کن.
     return await _maybe_focus(ctx, s, msg, text, u, is_answer=res is not None)
+
 
 async def _maybe_focus(ctx, s, msg, text, u, is_answer):
     if not s.focus_mode:
@@ -9111,7 +9962,6 @@ async def _maybe_focus(ctx, s, msg, text, u, is_answer):
     too_long = len(text.split()) > FOCUS_WORD_LIMIT
     if is_answer or not too_long:
         return False
-    # سازنده و ادمین‌های گروه معاف‌اند
     if await _is_privileged(ctx, s, s.chat_id, u.id):
         return False
     await _safe_delete(msg)
@@ -9133,6 +9983,7 @@ async def handle_start_during_game(update, ctx):
     return await _warn_and_maybe_mute(
         ctx, s, chat.id, u, "وقتی بازی فعاله نمی‌تونی بازی جدید شروع کنی")
 
+
 def _load_category_for_session(s):
     if s.mode_id == "classic_choice" and not s.category:
         return False
@@ -9144,50 +9995,36 @@ def _load_category_for_session(s):
     s.words = db.list_words(s.category) or []
     return bool(s.words) or s.is_round_based()
 
+
 def _player_mentions(s):
     return " ".join(
         f'<a href="tg://user?id={uid}">{html.escape(info.get("name") or "بازیکن")}</a>'
-        for uid, info in s.players.items()
-    )
+        for uid, info in s.players.items())
+
 
 def _suggestion_hint(text):
     t = (text or "").strip()
-    return (
-        t.startswith("+کلمه")
-        or t.startswith("پیشنهاد کلمه")
-        or t.startswith("/suggest")
-    )
+    return (t.startswith("+کلمه") or t.startswith("پیشنهاد کلمه")
+            or t.startswith("/suggest"))
+
 
 async def _handle_group_suggestion(update, ctx, s, text):
     from features import suggestion_service as ss
-
     raw = text.strip()
-
     for prefix in ("+کلمه", "پیشنهاد کلمه", "/suggest"):
         if raw.startswith(prefix):
             raw = raw[len(prefix):].strip()
             break
-
     parts = [p.strip() for p in raw.split("|")]
-
     if len(parts) < 2:
-        return await update.message.reply_text(
-            "فرمت: +کلمه کلمه | دسته | توضیح اختیاری"
-        )
-
+        return await update.message.reply_text("فرمت: +کلمه کلمه | دسته | توضیح اختیاری")
     u = update.effective_user
-
     ok, msg = ss.create(
-        u.id,
-        u.first_name,
-        parts[0],
-        parts[1],
-        parts[2] if len(parts) > 2 else "",
-        source="game",
-    )
-
+        u.id, u.first_name, parts[0], parts[1],
+        parts[2] if len(parts) > 2 else "", source="game")
     await update.message.reply_text(("✅ " if ok else "⚠️ ") + msg)
     return True
+
 ```
 
 
@@ -9591,6 +10428,641 @@ FILE: handlers\router.py
 ================================================================================
 
 ```py
+# -*- coding: utf-8 -*-
+"""مسیریاب پیام‌های متنی: نام نمایشی/پیشنهاد کلمه/ادمین (خصوصی) یا شروع/بازی (گروه)."""
+from telegram import Update
+from telegram.ext import ContextTypes
+from handlers import admin, lobby, menu, suggestions, namefamily_private
+from game import session as sess
+
+async def on_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    chat = update.effective_chat
+    text = update.message.text if update.message else ""
+
+    if chat.type == "private":
+        # اول: پاسخ‌های در حال ثبت اسم‌وفامیل
+        if await namefamily_private.on_nf_text(update, ctx):
+            return
+        # سپس: دریافت نام نمایشی (آنبوردینگ/تغییر نام)
+        if await menu.on_name_text(update, ctx):
+            return
+        # سپس: پیشنهاد کلمه
+        if await suggestions.on_suggest_text(update, ctx):
+            return
+        # سپس: ورودی‌های ادمین
+        if await admin.on_admin_text(update, ctx):
+            return
+        if await admin.on_words_text(update, ctx):
+            return
+        return
+
+    # گروه: «شروع کلمو» / «شروع بازی» → باز کردن لابی
+        # گروه
+    if lobby.is_start_text(text):
+        if sess.exists(chat.id):
+            # بازی فعاله → مثل /newgame تکراری رفتار کن (حذف + اخطار)
+            return await lobby.handle_start_during_game(update, ctx)
+        return await lobby.open_lobby(update, ctx)
+    await lobby.on_group_text(update, ctx)
+
+
+
+```
+
+
+================================================================================
+FILE: handlers\suggestions.py
+================================================================================
+
+```py
+# -*- coding: utf-8 -*-
+"""هندلر پیشنهاد کلمات توسط کاربران (در PV)."""
+
+from telegram.constants import ParseMode
+from features import suggestion_service as ss
+
+HTML = ParseMode.HTML
+
+
+async def start_suggest(update, ctx):
+    if update.effective_chat.type != "private":
+        msg = update.message
+        if msg:
+            return await msg.reply_text(
+                "پیشنهاد کلمه را در چت خصوصی ربات ثبت کن."
+            )
+        return
+    ctx.user_data["suggest_step"] = "word"
+    ctx.user_data["suggest_data"] = {}
+
+    target = (
+        update.callback_query.message
+        if update.callback_query
+        else update.message
+    )
+
+    send = (
+        target.edit_text
+        if update.callback_query
+        else target.reply_text
+    )
+
+    await send(
+        "💡 <b>پیشنهاد کلمه جدید</b>\n"
+        "━━━━━━━━━━━━━━\n"
+        "اول خود کلمه را بفرست:",
+        parse_mode=HTML
+    )
+
+
+async def on_suggest_text(update, ctx):
+    if update.effective_chat.type != "private":
+        return False
+
+    step = ctx.user_data.get("suggest_step")
+    if not step:
+        return False
+
+    text = (update.message.text or "").strip()
+    data = ctx.user_data.setdefault("suggest_data", {})
+
+    if step == "word":
+        data["word"] = text
+        ctx.user_data["suggest_step"] = "category"
+        await update.message.reply_text(
+            "حالا دسته‌بندی کلمه را بفرست. مثال: خوراکی، شهر، حیوان، بازیکنان فوتبال"
+        )
+        return True
+
+    if step == "category":
+        data["category"] = text
+        ctx.user_data["suggest_step"] = "description"
+        await update.message.reply_text("اگر توضیحی داری بفرست؛ اگر نداری فقط بنویس: -")
+        return True
+
+    if step == "description":
+        desc = "" if text == "-" else text
+
+        u = update.effective_user
+        ok, msg = ss.create(
+            uid=u.id,
+            user_name=u.first_name,
+            word=data.get("word"),
+            category=data.get("category"),
+            description=desc,
+            source=data.get("source", "menu")
+        )
+
+        ctx.user_data.pop("suggest_step", None)
+        ctx.user_data.pop("suggest_data", None)
+
+        await update.message.reply_text(("✅ " if ok else "⚠️ ") + msg)
+        return True
+
+    return False
+
+```
+
+
+================================================================================
+FILE: kalemo_seed_words.py
+================================================================================
+
+```py
+# -*- coding: utf-8 -*-
+"""Seed اختصاصی اسم‌وفامیل کلمو.
+
+فقط این دسته‌ها را نگه می‌دارد و کامل می‌کند:
+غذا، رنگ، میوه، حیوان، اشیا، عضو بدن، شهر، کشور، شغل
+"""
+
+from core import db
+
+
+def seed_kalemo_words():
+    db.init()
+    db.seed_namefamily_words(clean_extra_categories=True)
+    total = sum(count for _, count in db.list_categories())
+    return total
+
+
+if __name__ == "__main__":
+    total = seed_kalemo_words()
+    print(f"✅ NameFamily database cleaned and seeded. total words: {total}")
+
+```
+
+
+================================================================================
+FILE: main.py
+================================================================================
+
+```py
+# -*- coding: utf-8 -*-
+"""نقطه‌ی ورود ربات کلمو (Kalemo).
+ساخته‌شده با python-telegram-bot v21+ — کاملاً async، Application Builder،
+CallbackQueryHandler برای همه‌ی دکمه‌ها، و Menu Button تلگرام.
+
+اجرا:
+    export KALEMO_BOT_TOKEN="123:ABC"
+    export KALEMO_BOT_USERNAME="KalemoBot"
+    export KALEMO_ADMINS="1053046454"
+    python main.py
+"""
+
+import os
+
+import psutil
+import threading
+import time
+
+
+import logging
+import threading
+from web import run
+from telegram import (
+    Update, BotCommand, BotCommandScopeAllPrivateChats,
+    MenuButtonCommands,
+)
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application, ApplicationBuilder, CommandHandler, MessageHandler,
+    CallbackQueryHandler, ContextTypes, Defaults, filters,
+)
+
+import config
+from core import db
+from handlers import menu, admin, lobby, router, namefamily_private, garden
+
+from flask import Flask
+import threading
+
+app = Flask(__name__)
+
+
+@app.route("/")
+def home():
+    return "Kalemo Bot is alive!", 200
+
+def monitor():
+    p = psutil.Process()
+
+    while True:
+        cpu = p.cpu_percent(interval=1)
+        ram = p.memory_info().rss / 1024 / 1024
+
+        log.info(
+            f"CPU: {cpu:.1f}% | RAM: {ram:.1f} MB"
+        )
+
+        time.sleep(30)
+
+
+def run_web():
+    app.run(
+        host="0.0.0.0",
+        port=int(os.environ.get("PORT", 10000))
+    )
+
+threading.Thread(target=run_web).start()
+
+
+threading.Thread(
+    target=run,
+    daemon=True
+).start()
+
+logging.basicConfig(
+    format="%(asctime)s | %(name)s | %(levelname)s | %(message)s",
+    level=logging.INFO,
+)
+log = logging.getLogger("kalemo")
+
+
+# ---------- Menu Button + Commands ----------
+async def _post_init(app: Application):
+    """ثبت دستورها و فعال‌سازی Menu Button تلگرام (UI بدون یادگیری دستور)."""
+    private_cmds = [
+        BotCommand("start", "🎮 ایجاد بازی / منوی اصلی"),
+        BotCommand("play", "▶ ادامه/شروع بازی"),
+        BotCommand("profile", "👤 پروفایل"),
+        BotCommand("garden", "🌳 باغچه"),
+        BotCommand("leaderboard", "🏆 لیدربورد"),
+        BotCommand("settings", "⚙ تنظیمات"),
+        BotCommand("help", "❓ راهنما"),
+    ]
+    await app.bot.set_my_commands(
+        private_cmds, scope=BotCommandScopeAllPrivateChats())
+    # دکمه‌ی منوی تلگرام → فهرست دستورها
+    await app.bot.set_chat_menu_button(menu_button=MenuButtonCommands())
+    log.info("Menu button & commands registered.")
+
+
+# ---------- میان‌برهای منو از طریق دستور ----------
+async def cmd_menu_shortcut(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """دستورهای منو در چت خصوصی را به همان نمای دکمه‌ای می‌رساند."""
+    if update.effective_chat.type != "private":
+        return await update.message.reply_text(
+            "🎮 برای بازی تو گروه «شروع کلمو» بنویس یا /newgame بزن!")
+    from features import player_service as svc
+    from ui import keyboards as kb, persona, cards
+    uid = update.effective_user.id
+    name = svc.display_name(uid, update.effective_user.first_name)
+    svc.register(uid, update.effective_user.first_name)
+    cmd = (update.message.text or "/").split()[0].lstrip("/").split("@")[0]
+
+    if cmd == "profile":
+        return await update.message.reply_text(
+            svc.profile_view(uid, name), parse_mode=ParseMode.HTML,
+            reply_markup=kb.profile_menu())
+    if cmd == "leaderboard":
+        rows = db.top_players(10)
+        return await update.message.reply_text(
+            cards.leaderboard_card("لیدربورد", rows), parse_mode=ParseMode.HTML,
+            reply_markup=kb.back_menu())
+    if cmd == "settings":
+        cur = db.get_display_name(uid) or "—"
+        return await update.message.reply_text(
+            "⚙ <b>تنظیمات</b>\n━━━━━━━━━━━━━━\nنام نمایشی فعلی: <b>%s</b>" % cur,
+            parse_mode=ParseMode.HTML, reply_markup=kb.settings_menu())
+    if cmd == "help":
+        return await update.message.reply_text(
+            "❓ منو رو به گروه اضافه کن و «شروع کلمو» بنویس 🔥",
+            reply_markup=kb.play_in_group())
+    # play / default
+    return await update.message.reply_text(
+        persona.say("welcome"), reply_markup=kb.main_menu())
+
+
+def build_app() -> Application:
+    db.init()
+    defaults = Defaults(parse_mode=None)
+    app = (ApplicationBuilder()
+           .token(config.BOT_TOKEN)
+           .defaults(defaults)
+           .post_init(_post_init)
+           .build())
+
+    # دستورهای پایه
+    app.add_handler(CommandHandler("start", menu.cmd_start))
+    app.add_handler(CommandHandler(["play", "profile", "leaderboard", "settings", "help"],
+                                   cmd_menu_shortcut))
+    app.add_handler(CommandHandler("admin", admin.cmd_admin))
+    app.add_handler(CommandHandler("garden", garden.cmd_garden))
+
+    # بازی گروهی
+    app.add_handler(CommandHandler("newgame", lobby.cmd_newgame))
+    app.add_handler(CommandHandler("endgame", lobby.cmd_endgame))
+    app.add_handler(CommandHandler("gsettings", lobby.cmd_settings))
+
+    # CallbackQueryها — همه دکمه‌محور
+    app.add_handler(CallbackQueryHandler(menu.on_onboarding, pattern=r"^ob:"))
+    app.add_handler(CallbackQueryHandler(menu.on_mission_claim, pattern=r"^mission:"))
+    app.add_handler(CallbackQueryHandler(namefamily_private.on_nf_cb, pattern=r"^nf:"))
+    app.add_handler(CallbackQueryHandler(garden.on_cb, pattern=r"^g:"))
+    app.add_handler(CallbackQueryHandler(menu.on_menu, pattern=r"^m:"))
+    app.add_handler(CallbackQueryHandler(admin.on_admin_cb, pattern=r"^a:"))
+    app.add_handler(CallbackQueryHandler(lobby.on_cb, pattern=r"^k:"))
+
+    # پیام‌های متنی → مسیریاب
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, router.on_text))
+
+    return app
+
+
+def main():
+    if not config.BOT_TOKEN or config.BOT_TOKEN.startswith("PUT-YOUR"):
+        raise SystemExit("⛔️ KALEMO_BOT_TOKEN ست نشده. متغیر محیطی رو تنظیم کن.")
+    threading.Thread(
+        target=run,
+        daemon=True
+    ).start()
+    app = build_app()
+    log.info("Kalemo is running…")
+    threading.Thread(
+        target=monitor,
+        daemon=True
+    ).start()
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
+
+
+if __name__ == "__main__":
+    main()
+
+```
+
+
+================================================================================
+FILE: MIGRATION_GUIDE_fa.md
+================================================================================
+
+```md
+# مهاجرت کلمو از SQLite به PostgreSQL (روی Render، سازگار با ایران)
+
+این راهنما تمام مراحل انتقال ربات تلگرام «کلمو» از SQLite به PostgreSQL را
+قدم‌به‌قدم توضیح می‌دهد. **رفتار و امکانات ربات دقیقاً مثل قبل باقی می‌ماند** —
+فقط لایه‌ی ذخیره‌سازی عوض شده است.
+
+---
+
+## ۱) چرا این مهاجرت لازم بود؟
+
+روی پلن رایگان Render، فایل‌سیستم **موقتی (ephemeral)** است. هر بار که سرویس
+دیپلوی مجدد یا ری‌استارت می‌شود، فایل `kalemo.db` پاک می‌شود و همه‌ی بازیکن‌ها،
+سکه‌ها، پیشرفت‌ها و باغچه‌ها از بین می‌روند. PostgreSQLِ Render یک دیتابیس
+**پایدار و جدا از سرویس** است، بنابراین داده‌ها باقی می‌مانند.
+
+---
+
+## ۲) چه چیزهایی تغییر کرد؟
+
+نکته‌ی کلیدی: **تمام کدهای SQLite فقط در دو فایل بودند** — `core/db.py` و
+`core/garden_db.py`. بقیه‌ی پروژه (هندلرها، مودهای بازی، UI، سرویس‌ها) همگی
+از توابع `db.*` استفاده می‌کنند. چون **امضای همه‌ی توابع عمومی بدون تغییر مانده**،
+هیچ فایل دیگری نیاز به تغییر ندارد.
+
+فایل‌هایی که باید جایگزین شوند:
+
+| فایل | تغییر |
+| --- | --- |
+| `core/db.py` | بازنویسی کامل با psycopg ۳ + connection pool |
+| `core/garden_db.py` | بازنویسی کامل با psycopg ۳ |
+| `config.py` | افزودن `DB_POOL_MAX` و توضیح `DATABASE_URL` |
+| `requirements.txt` | حذف `SQLAlchemy` (استفاده نمی‌شد)، افزودن `psycopg-pool` |
+
+فایل‌هایی که **دست‌نخورده** می‌مانند: `main.py`, `web.py`, همه‌ی `handlers/*`,
+همه‌ی `game/*`, `features/*`, `ui/*`, `seeds.py`, `runtime.txt`.
+
+### جزئیات فنی تغییرات کد
+
+| مورد در SQLite | معادل در PostgreSQL |
+| --- | --- |
+| `sqlite3.connect(path)` | `ConnectionPool(DATABASE_URL)` |
+| `row_factory = sqlite3.Row` | `row_factory = dict_row` |
+| placeholder `?` | placeholder `%s` |
+| `INTEGER PRIMARY KEY AUTOINCREMENT` | `INTEGER GENERATED ALWAYS AS IDENTITY PRIMARY KEY` |
+| `INTEGER` برای `user_id/chat_id` | `BIGINT` (آی‌دی‌های تلگرام بزرگ‌اند) |
+| `cursor.lastrowid` | `INSERT ... RETURNING id` سپس `fetchone()["id"]` |
+| `INSERT OR IGNORE` | `INSERT ... ON CONFLICT DO NOTHING` |
+| `executescript(...)` | `execute(...)` (psycopg چند دستور را می‌پذیرد) |
+| `sqlite3.IntegrityError` | `psycopg.errors.UniqueViolation` (به‌صورت `db.IntegrityError` هم در دسترس است) |
+| `PRAGMA table_info(t)` | کوئری روی `information_schema.columns` |
+| `PRAGMA foreign_keys=ON` | حذف شد (کلیدهای خارجی در Postgres به‌صورت پیش‌فرض اعمال می‌شوند) |
+
+> نکته درباره‌ی UPSERT: در Postgres وقتی در بخش `DO UPDATE` به ستونی ارجاع می‌دهید
+> که هم در جدول و هم در ردیف جدید وجود دارد، باید نام جدول را ذکر کنید
+> (مثلاً `garden_seeds.qty + 1` به‌جای `qty + 1`). این نکته اصلاح شده است.
+
+### سازگاری با کد قدیمی
+اگر جایی در پروژه `sqlite3.IntegrityError` را می‌گرفتید، حالا از `db.IntegrityError`
+استفاده کنید (که به `psycopg.errors.UniqueViolation` اشاره می‌کند). در کد فعلی شما
+این خطا فقط داخل خودِ `db.py` استفاده می‌شود، پس نیازی به تغییر جای دیگری نیست.
+
+---
+
+## ۳) داده‌های موجود
+
+شما انتخاب کردید که با یک **دیتابیس خالی تازه** شروع کنید. با اولین اجرا،
+تابع `db.init()` (که در `build_app()` داخل `main.py` صدا زده می‌شود) به‌صورت
+خودکار جدول‌ها را می‌سازد و بانک کلمات NameFamily و دسته‌های پیش‌فرض را seed می‌کند.
+پس نیازی به هیچ اسکریپت انتقال داده نیست. (بازیکن‌ها و پیشرفت‌ها از صفر شروع می‌شوند.)
+
+---
+
+## ۴) چرا این گزینه از ایران کار می‌کند؟
+
+- **دیتابیس روی خود Render** است و از طریق **Internal Database URL** به سرویس ربات
+  وصل می‌شود. این اتصال داخل شبکه‌ی Render برقرار می‌شود، نه از داخل ایران.
+- شما فقط برای **دیپلوی و مدیریت پنل Render** به اینترنت وصل می‌شوید؛ اگر
+  render.com برایتان باز نشد، از یک VPN/پروکسی فقط برای باز کردن پنل استفاده کنید.
+  خودِ ربات و دیتابیس در دیتاسنتر Render اجرا می‌شوند و به فیلترینگ ایران ربطی ندارند.
+- سرویس‌هایی که معمولاً از ایران دردسر دارند (مثلاً بعضی پنل‌های ابری) اینجا دور
+  زده می‌شوند چون کل استک روی Render است.
+
+---
+
+## ۵) ساخت دیتابیس PostgreSQL روی Render
+
+1. وارد داشبورد Render شوید → **New +** → **PostgreSQL**.
+2. یک نام بگذارید (مثلاً `kalemo-db`)، **Region** را همان ریجن سرویس ربات انتخاب کنید
+   (مهم است که هر دو در یک ریجن باشند تا Internal URL کار کند)، و **Free** را انتخاب کنید.
+3. **Create Database** را بزنید و چند دقیقه صبر کنید تا وضعیت «Available» شود.
+4. وارد صفحه‌ی دیتابیس شوید → بخش **Connections**:
+   - **Internal Database URL** را کپی کنید (این را برای سرویس ربات استفاده می‌کنیم).
+   - (اختیاری) **External Database URL** برای اتصال از بیرون است.
+
+> ⚠️ دیتابیس رایگان Render بعد از **۳۰ روز منقضی** می‌شود. برای پروژه‌ی جدی
+> بعداً پلن پولی بگیرید یا از Neon (رایگان و بدون انقضا) استفاده کنید. اگر روزی
+> به Neon رفتید، فقط کافی است `DATABASE_URL` را عوض کنید؛ کد بدون تغییر کار می‌کند.
+> (برای Neon معمولاً باید `?sslmode=require` به انتهای URL اضافه شود.)
+
+---
+
+## ۶) تنظیم متغیرهای محیطی
+
+### روی Render (سرویس ربات — Web Service)
+وارد سرویس ربات شوید → **Environment** → **Add Environment Variable** و این‌ها را بسازید:
+
+| Key | Value |
+| --- | --- |
+| `DATABASE_URL` | همان **Internal Database URL** که کپی کردید |
+| `KALEMO_BOT_TOKEN` | توکن ربات از @BotFather |
+| `KALEMO_BOT_USERNAME` | یوزرنیم ربات بدون @ |
+| `KALEMO_ADMINS` | آیدی عددی ادمین‌ها، با کاما: `1053046454` |
+| `DB_POOL_MAX` | `5` (اختیاری) |
+
+`PORT` را Render خودش ست می‌کند؛ لازم نیست دستی بگذارید (کد از `os.environ["PORT"]` می‌خواند).
+
+### روی سیستم خودتان (تست محلی)
+یک فایل `.env` کنار پروژه بسازید:
+
+```
+KALEMO_BOT_TOKEN=123:ABC
+KALEMO_BOT_USERNAME=KalemoBot
+KALEMO_ADMINS=1053046454
+DATABASE_URL=postg://user:pass@host:5432/dbname
+DB_POOL_MAX=5
+```
+
+> اگر می‌خواهید محلی هم واقعاً به Postgress وصل شوید، می‌توانید External Database URL
+> را در `.env` بگذارید. فایل `.env` را حتماً در `.gitignore` قرار دهید.
+
+---
+
+## ۷) جایگزینی فایل‌ها
+
+فایل‌های موجود در پوشه‌ی `kalemo_pg/` را جایگزین فایل‌های هم‌نام در پروژه کنید:
+
+```
+kalemo_pg/config.py            →  config.py
+kalemo_pg/requirements.txt     →  requirements.txt
+kalemo_pg/core/db.py           →  core/db.py
+kalemo_pg/core/garden_db.py    →  core/garden_db.py
+```
+
+بقیه‌ی فایل‌ها را دست نزنید.
+
+---
+
+## ۸) دیپلوی روی Render
+
+تنظیمات سرویس ربات (Web Service):
+
+- **Build Command:** `pip install -r requirements.txt`
+- **Start Command:** `python main.py`
+- **Instance Type:** Free
+
+بعد از set کردن متغیرهای محیطی، **Manual Deploy → Deploy latest commit** را بزنید.
+با اولین اجرا، `db.init()` جدول‌ها را می‌سازد و کلمات را seed می‌کند. در لاگ باید ببینید:
+
+```
+Menu button & commands registered.
+Kalemo is running…
+```
+
+اگر `DATABASE_URL` ست نشده باشد، ربات با پیام واضح
+«DATABASE_URL تنظیم نشده است...» بالا نمی‌آید — این عمدی است تا زود متوجه شوید.
+
+---
+
+## ۹) بررسی سلامت
+
+- به آدرس سرویس (`https://<your-service>.onrender.com/`) بروید؛ باید ببینید
+  `Kalemo Bot is alive!`.
+- در تلگرام `/start` بزنید؛ باید پروفایل و منو بیاید.
+- یک بازی گروهی یا NameFamily انجام دهید و مطمئن شوید سکه/XP ذخیره می‌شود.
+- سرویس را یک‌بار **Restart** کنید و دوباره `/profile` بزنید — این بار **داده‌ها
+  باقی می‌مانند** (که کل هدف مهاجرت بود). ✅
+
+---
+
+## ۱۰) استفاده از Supabase به‌جای Render Postgres
+
+خبر خوب: کدی که نوشتیم (`core/db.py`) از هر آدرس استاندارد PostgreSQL پشتیبانی
+می‌کند، پس نیازی به تغییر هیچ کد دیگری نیست — فقط کافی‌ست `DATABASE_URL` درست
+تنظیم شود. اما ⚠️ **نکته‌ی خیلی مهم**: کانکشن‌استرینگی که فرستادید
+(`db.pzalhcdhctrzesxqsyvz.supabase.co:5432`) آدرس **مستقیم (Direct Connection)**
+سوپابیس است که این روزها **فقط IPv6** است. سرورهای Render (پلن رایگان) از
+شبکه‌ی IPv4 خارج می‌شوند، پس این اتصال معمولاً با خطای timeout/connection refused
+روی Render شکست می‌خورد. راه‌حل: به‌جای Direct Connection از **Connection Pooler**
+سوپابیس استفاده کنید که IPv4-friendly است.
+
+### ۱۰.۱) گرفتن آدرس درست از پنل Supabase
+
+1. وارد پروژه‌ی Supabase شوید → **Project Settings** (⚙️) → **Database**.
+2. بخش **Connection string** را باز کنید.
+3. تب **Connection pooling** را انتخاب کنید (نه «Direct connection»).
+4. حالت (Mode) را روی **Session** بگذارید (چون کد ما هر بار یک تراکنش کامل
+   با `commit/rollback` انجام می‌دهد و به‌جز pool خودمان، pooler هم لازم داریم؛
+   Session mode برای این الگو مطمئن‌تر است. اگر بعداً خواستید Transaction mode
+   را هم امتحان کنید مشکلی نیست).
+5. آدرسی که نشان داده می‌شود شبیه این است (پورت و هاست فرق می‌کند با Direct):
+
+   ```
+   postgresql://postgres.pzalhcdhctrzesxqsyvz:[YOUR-PASSWORD]@aws-0-<region>.pooler.supabase.com:5432/postgres
+   ```
+
+   (دقت کنید: یوزرنیم اینجا به‌صورت `postgres.<project-ref>` است، نه فقط `postgres`.
+   هاست هم `pooler.supabase.com` است، نه `supabase.co`.)
+
+6. به‌جای `[YOUR-PASSWORD]` پسورد دیتابیسی که هنگام ساخت پروژه تعیین کردید را
+   بگذارید. اگر یادتان نیست، در همان صفحه دکمه‌ی **Reset database password**
+   هست.
+
+7. در انتهای این آدرس عبارت `?sslmode=require` را اضافه کنید (Supabase روی
+   اتصال بدون SSL را می‌بندد):
+
+   ```
+   postgresql://postgres.pzalhcdhctrzesxqsyvz:MyStrongPass123@aws-0-eu-central-1.pooler.supabase.com:5432/postgres?sslmode=require
+   ```
+
+### ۱۰.۲) ست‌کردن در Render
+
+وارد سرویس ربات در Render شوید → **Environment** → مقدار `DATABASE_URL` را
+دقیقاً با همین آدرس نهایی (پولر + پسورد واقعی + `?sslmode=require`) جایگزین کنید.
+بقیه‌ی متغیرها (`KALEMO_BOT_TOKEN`, `KALEMO_BOT_USERNAME`, `KALEMO_ADMINS`,
+`DB_POOL_MAX`) همان‌طور که در بخش ۶ گفته شد باقی می‌مانند.
+
+> اگر پسورد شما در خودش کاراکترهای خاص دارد (مثل `@`, `:`, `/`, `#`) باید
+> URL-encode شود، وگرنه اتصال parse نمی‌شود. مثلاً `@` می‌شود `%40`.
+> ساده‌ترین راه: یک پسورد ساده‌ی فقط حروف/عدد برای دیتابیس بسازید تا این مشکل
+> پیش نیاید (از همان دکمه‌ی Reset database password).
+
+### ۱۰.۳) دیپلوی و تست
+
+1. **Manual Deploy → Deploy latest commit** را در Render بزنید.
+2. در لاگ سرویس دنبال خط `Kalemo is running…` بگردید؛ اگر خطای اتصال دیدید
+   (`could not translate host name` یا `timeout`) یعنی هنوز از Direct Connection
+   استفاده می‌کنید — به قدم ۱۰.۱ برگردید و مطمئن شوید از آدرس Pooler استفاده
+   کرده‌اید.
+3. در تلگرام `/start` بزنید و یک بازی انجام دهید.
+4. برای اطمینان از ماندگاری داده: در پنل Supabase → **Table Editor** بروید و
+   جدول `players` را باز کنید؛ باید ردیف بازیکن‌تان را ببینید.
+5. سرویس Render را **Restart** کنید و دوباره `/profile` بزنید — چون Supabase
+   منقضی نمی‌شود، **هیچ‌وقت** داده پاک نمی‌شود، حتی بعد از دیپلوی‌های مکرر. ✅
+
+### ۱۰.۴) چرا Supabase انتخاب خوبی است
+- دیتابیس رایگان Supabase **منقضی نمی‌شود** (برخلاف Render Postgres رایگان که
+  بعد از ۳۰ روز پاک می‌شود) — پروژه فقط اگر ۷ روز کامل هیچ فعالیتی نداشته باشد
+  به حالت Pause می‌رود که با یک بازدید از پنل یا اولین ریکوئست دوباره فعال می‌شود.
+- از ایران معمولاً در دسترس است (چون فقط سرویس ربات روی Render با آن صحبت
+  می‌کند، نه دستگاه شما مستقیماً).
+- کد فعلی نیازی به هیچ تغییری برای Supabase نداشت؛ فقط `DATABASE_URL` عوض شد.
+
+---
+
+## ۱۱) اشکال‌زدایی
+
+| علامت | علت محتمل | راه‌حل |
+| --- | --- | --- |
+| `RuntimeError: DATABASE_URL تنظیم نشده` | متغیر محیطی ست نشده | در Environment سرویس، `DATABASE_URL` را بگذارید |
+| `connection refused` / timeout | استفاده از External URL یا ریجن متفاوت | از **Internal** URL و همان ریجن استفاده کنید |
+| `SSL required` | provider خارجی (مثل Neon) | به انتهای URL `?sslmode=require` اضافه کنید |
+| `too many connections` | pool بزرگ | `DB_POOL_MAX` را کم کنید (مثلاً `3`) |
+| جدول‌ها ساخته نمی‌شوند | `db.init()` صدا زده نشده | مطمئن شوید `main.py` بدون خطا `build_app()` را اجرا می‌کند |
+| `could not translate host name "db.xxx.supabase.co"` | استفاده از Direct Connection که IPv6-only است | آدرس **Pooler** (`*.pooler.supabase.com`) را از بخش ۱۰ استفاده کنید |
+| `password authentication failed` | پسورد اشتباه یا کاراکتر خاص URL-encode نشده | پسورد را Reset کنید و یک پسورد ساده (فقط حروف/عدد) بگذارید |
+| `SSL connection required` | فراموش‌کردن `?sslmode=require` | به انتهای `DATABASE_URL` این را اضافه کنید |
 
 ```
 
@@ -9617,8 +11089,9 @@ python-dotenv==1.0.1
 httpx==0.27.2
 flask
 psutil
-psycopg[binary]
-SQLAlchemy
+psycopg[binary]==3.2.3
+psycopg-pool==3.2.4
+
 ```
 
 
@@ -10644,7 +12117,7 @@ import random
 NAME = "کلمو"
 LINES = {
     "welcome": [
-        "سلام رفیق! 👋 من {name}‌ام، استاد بازی‌های کلمه‌ای.\nآماده‌ای مغزتو قلقلک بدم؟ 😏",
+        "سلام رفیق! 👋 من {name}‌ام، استاد بازی‌های کلمه‌ای.\n",
         "به‌به! یه بازیکن تازه‌نفس 🔥 من {name}‌ام؛ بزن بریم ببینم چند مرده حلاجی!",
     ],
     "win": [
