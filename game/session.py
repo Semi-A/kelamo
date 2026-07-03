@@ -73,6 +73,11 @@ class Session:
         self.status_task = None
         # ---- شناسه پیام زنده‌ی بازی ----
         self.live_msg_id = None
+        # ---- کنترل نرخ ویرایش پیام زنده (rate limit) ----
+        self.live_lock = None            # asyncio.Lock (تنبل ساخته می‌شود)
+        self.live_last_edit = 0.0        # زمان آخرین edit موفق
+        self.live_dirty = False          # آپدیت معلق هست؟
+        self.live_flusher = None         # task فلش تأخیری
         self.correct_total = 0
         self.wrong_total = 0
         self.correct_by_user = {}
@@ -138,14 +143,10 @@ class Session:
     def build_mode(self):
         cls = get_mode_class(self.mode_id)
         kwargs = {"ruleset": self.ruleset}
-        if self.mode_id in ("classic_random", "classic_choice"):
+        if self.mode_id in ("classic_random", "classic_choice", "chain"):
             kwargs["category"] = self.category
-        if self.mode_id == "blank":
-            kwargs["difficulty"] = self.difficulty
         self.mode = cls(self.words, **kwargs)
-        return self.mode
-
-    # ---- gameplay ----
+        return self.mode    # ---- gameplay ----
     def _question_signature(self, q):
         """امضای یکتا برای یک سوال، جهت جلوگیری از تکرار در یک مسابقه."""
         if not isinstance(q, dict):

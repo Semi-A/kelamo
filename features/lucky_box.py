@@ -15,7 +15,7 @@ logger = logging.getLogger("kalemo.luckybox")
 BOX_NAME = "🎁 جعبه شانس"
 
 # احتمال ظاهر شدن جعبه شانس بعد از هر مسابقه (به‌ازای هر بازیکن).
-DROP_CHANCE = 0.10
+DROP_CHANCE = 0.05
 
 ITEMS = [
     {"type": "coin", "value": 30, "rarity": "common", "weight": 40},

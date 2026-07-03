@@ -36,7 +36,15 @@ class ClueMode(BaseMode):
 
     def __init__(self, words, ruleset=None, **kw):
         super().__init__(words, ruleset)
-        self._recent = []
+        self._pool = None      # کش تنبل کلمات دارای سرنخ معتبر
+        self._used = set()      # کلماتی که همین بازی به‌عنوان سوال آمده‌اند
+
+    def _load_pool(self):
+        from core import db
+        # فقط کلماتی با clue معتبر و غیرخالی، مستقیم از دیتابیس
+        rows = [r for r in db.clue_pool() if (r.get("clue") or "").strip()]
+        random.shuffle(rows)   # هر بازی کاملاً تصادفی
+        self._pool = rows
 
     def tutorial(self):
         return ("🕵️ <b>مود سرنخ</b>\n"
@@ -44,18 +52,28 @@ class ClueMode(BaseMode):
                 "مثال: <code>سلطان جنگل</code> ← <b>شیر</b>\nآماده باشید...")
 
     def new_question(self):
-        clue, answers = random.choice(CLUES)
-        for _ in range(8):
-            if clue not in self._recent:
-                break
-            clue, answers = random.choice(CLUES)
-        self._recent = (self._recent + [clue])[-6:]
+        if self._pool is None:
+            self._load_pool()
+
+        # کلمه‌ای انتخاب کن که هنوز به‌عنوان سوال استفاده نشده
+        candidates = [r for r in self._pool
+                      if r["word"] not in self._used]
+        if not candidates:
+            # همه سرنخ‌ها مصرف شده‌اند → دوره جدید
+            self._used.clear()
+            candidates = list(self._pool)
+        if not candidates:
+            return {"prompt": "سرنخی برای این بازی ثبت نشده 😅", "answers": set()}
+
+        row = random.choice(candidates)
+        self._used.add(row["word"])
         return {
-            "prompt": f"🕵️ <b>سرنخ:</b>\n\n<b>{clue}</b>\n\n<i>جواب رو حدس بزن!</i>",
-            "answers": {self.norm(a) for a in answers},
+            "prompt": (f"🕵️ <b>سرنخ:</b>\n\n<b>{row['clue']}</b>\n\n"
+                       f"<i>جواب رو حدس بزن!</i>"),
+            "answers": {self.norm(row["word"])},
         }
 
     def check_answer(self, question, text):
-        if self.norm(text) in question["answers"]:
+        if self.norm(text) in question.get("answers", set()):
             return True, None
         return False, "نادرست"

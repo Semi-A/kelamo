@@ -23,7 +23,7 @@ import logging
 import re
 import time
 from datetime import timedelta
-
+from telegram.error import RetryAfter
 from telegram import Update, ChatPermissions
 from telegram.ext import ContextTypes
 from telegram.constants import ParseMode
@@ -435,11 +435,31 @@ async def _autoskip(ctx, s):
     """سوال فعلی را رد می‌کند و سوال بعدی را نمایش می‌دهد."""
     try:
         prev = s.question.get("prompt") if isinstance(s.question, dict) else None
+        # مود سرنخ: قبل از رد کردن، جواب سرنخ قبلی را لو بده
+        if s.mode_id == "clue" and isinstance(s.question, dict):
+            reveal = s.question.get("reveal")
+            if reveal:
+                try:
+                    await ctx.bot.send_message(
+                        s.chat_id,
+                        f"⏰ کسی جواب نداد!\nجواب درست: <b>{reveal}</b>",
+                        parse_mode=HTML)
+                except Exception:
+                    pass
+
         s.next_question()
-        s.last_answer_at = time.time()   # تایمر auto-skip را ریست کن
-        # اگر واقعاً سوال عوض شد، اطلاع بده
+        s.last_answer_at = time.time()
+
+        # مود سرنخ: سرنخ بعدی را در پیام جدید بفرست
+        if s.mode_id == "clue" and isinstance(s.question, dict):
+            try:
+                await ctx.bot.send_message(
+                    s.chat_id, s.question["prompt"], parse_mode=HTML)
+            except Exception:
+                pass
+
         cur = s.question.get("prompt") if isinstance(s.question, dict) else None
-        if cur != prev:
+        if cur != prev and s.mode_id != "clue":
             try:
                 await ctx.bot.send_message(
                     s.chat_id, "⏭ کسی جواب نداد؛ سوال بعدی!", parse_mode=HTML)
@@ -448,7 +468,6 @@ async def _autoskip(ctx, s):
         await _update_live(ctx, s)
     except Exception:
         log.exception("خطا در auto-skip (chat_id=%s)", s.chat_id)
-
 
 async def _status_loop(ctx, s):
     """هر STATUS_INTERVAL ثانیه یک پیام وضعیت کوتاه در گروه می‌فرستد تا مسابقه
@@ -475,18 +494,46 @@ async def _status_loop(ctx, s):
         log.exception("خطای غیرمنتظره در حلقه‌ی وضعیت (chat_id=%s)", s.chat_id)
 
 
+MIN_EDIT_INTERVAL = 1.0   # حداکثر یک ویرایش در ثانیه برای هر مسابقه
+
+
 async def _update_live(ctx, s):
+    """آپدیت پیام زنده با محدودیت نرخ: حداکثر ۱ ویرایش/ثانیه، فقط آخرین وضعیت."""
     if not s.live_msg_id:
         return
-    try:
-        await ctx.bot.edit_message_text(
-            chat_id=s.chat_id, message_id=s.live_msg_id,
-            text=panels.live_text(s), parse_mode=HTML,
-            reply_markup=panels.running_kb(s))
-    except Exception:
-        # خطای «message is not modified» عادی است؛ لاگ نمی‌کنیم.
-        pass
+    if s.live_lock is None:
+        s.live_lock = asyncio.Lock()
 
+    s.live_dirty = True
+    # اگر فلشری در حال کار است، همان آخرین وضعیت را می‌فرستد؛ نیازی به task جدید نیست.
+    if s.live_flusher and not s.live_flusher.done():
+        return
+    s.live_flusher = asyncio.create_task(_flush_live(ctx, s))
+
+
+async def _flush_live(ctx, s):
+    async with s.live_lock:
+        while s.live_dirty:
+            wait = MIN_EDIT_INTERVAL - (time.time() - s.live_last_edit)
+            if wait > 0:
+                await asyncio.sleep(wait)
+            # آخرین وضعیت را برمی‌داریم (coalescing)
+            s.live_dirty = False
+            cur = sess.get(s.chat_id)
+            if not cur or cur is not s or not s.live_msg_id:
+                return
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=s.chat_id, message_id=s.live_msg_id,
+                    text=panels.live_text(s), parse_mode=HTML,
+                    reply_markup=panels.running_kb(s))
+                s.live_last_edit = time.time()
+            except RetryAfter as e:
+                await asyncio.sleep(float(getattr(e, "retry_after", 1)) + 0.5)
+                s.live_dirty = True   # دوباره تلاش کن
+            except Exception:
+                # مثل «message is not modified» — نادیده بگیر.
+                pass
 
 # ---------- پایان ----------
 async def _finish(ctx, chat_id, reason=None):
@@ -605,9 +652,15 @@ async def on_group_text(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return True
 
         s.next_question()
+        # مود سرنخ: سرنخ جدید را در یک پیام جدید هم اعلام کن
+        if s.mode_id == "clue" and isinstance(s.question, dict):
+            try:
+                await ctx.bot.send_message(
+                    chat.id, s.question["prompt"], parse_mode=HTML)
+            except Exception:
+                pass
         await _update_live(ctx, s)
         return True
-
     # پاسخ تکراری: فقط یک تذکر کوتاه، بدون کسر امتیاز.
     if res and res.get("reason") == "duplicate":
         try:

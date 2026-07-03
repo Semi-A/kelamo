@@ -1,21 +1,15 @@
-# -*- coding: utf-8 -*-
-"""رجیستری مودها (Mode System).
-هر مود یک ماژول مستقل است؛ افزودن مود جدید = ساخت کلاس + یک خط در REGISTRY.
-"""
-"""رجیستری مودها (Mode System)."""
 from .classic import ClassicRandomMode, ClassicChoiceMode
-from .blank import BlankMode
+from .chain import ChainMode
 from .variable import VariableMode
 from .namefamily import NameFamilyMode
 from .clue import ClueMode
 
-# ترتیب نمایش در پنل انتخاب مود
-MODE_ORDER = ["classic_random", "classic_choice", "blank", "namefamily", "variable", "clue"]
+MODE_ORDER = ["classic_random", "classic_choice", "chain", "namefamily", "variable", "clue"]
 
 REGISTRY = {
     ClassicRandomMode.id: ClassicRandomMode,
-    BlankMode.id: BlankMode,
     ClassicChoiceMode.id: ClassicChoiceMode,
+    ChainMode.id: ChainMode,
     VariableMode.id: VariableMode,
     NameFamilyMode.id: NameFamilyMode,
     ClueMode.id: ClueMode,
@@ -32,11 +26,6 @@ _META = {
         "emoji": "📂",
         "desc": "سازنده دسته را انتخاب می‌کند."
     },
-    "blank": {
-        "name": "جای خالی",
-        "emoji": "🧩",
-        "desc": "کلمه‌ی ناقص را کامل کن."
-    },
     "namefamily": {
         "name": "اسم‌وفامیل",
         "emoji": "✍️",
@@ -51,6 +40,11 @@ _META = {
         "name": "سرنخ",
         "emoji": "🕵️",
         "desc": "از روی سرنخ، جواب را حدس بزن."
+    },
+    "chain": {
+        "name": "زنجیره",
+        "emoji": "⛓",
+        "desc": "هر کلمه با حرف آخرِ کلمه‌ی قبلی شروع می‌شود.",
     },
 }
 
