@@ -4,6 +4,8 @@ from telegram import InlineKeyboardButton as B, InlineKeyboardMarkup as M
 from game.modes import MODE_ORDER, mode_meta
 from game.rules import REGISTRY
 from game.session import TIME_OPTIONS, DIFFICULTY_OPTIONS, time_label, difficulty_label
+from telegram import InlineKeyboardButton as B
+from telegram import InlineKeyboardMarkup as M
 
 DIV = "────────────────"
 
@@ -268,3 +270,43 @@ def finish_text(s, reason=None):
     ]
 
     return "\n".join(lines)
+
+def namefamily_category_text():
+    return (
+        "✍️ <b>انتخاب دسته‌های اسم‌وفامیل</b>\n"
+        + DIV +
+        "\n\n"
+        "هر تعداد دسته خواستی انتخاب کن.\n"
+        "اگر هیچ دسته‌ای انتخاب نکنی، ربات ۶ دسته تصادفی انتخاب می‌کند."
+    )
+
+def namefamily_category_kb(s):
+
+    cats = db.list_categories()
+
+    rows = []
+
+    for cat, cnt in cats:
+
+        mark = "✅" if cat in s.namefamily_categories else "⬜"
+
+        rows.append([
+            B(
+                f"{mark} {cat}",
+                callback_data=f"lobby:nftoggle:{cat}"
+            )
+        ])
+
+    rows.append([
+        B("🎲 انتخاب تصادفی", callback_data="lobby:nfrandom")
+    ])
+
+    rows.append([
+        B("✅ تایید", callback_data="lobby:nfdone")
+    ])
+
+    rows.append([
+        B("◀ بازگشت", callback_data="lobby:back")
+    ])
+
+    return M(rows)

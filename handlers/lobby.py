@@ -17,6 +17,7 @@
 - سازگاری با session.submit جدید (کلیدهای points/found/total) و پاسخ تکراری.
 - «Lucky Box» → «🎁 جعبه شانس».
 """
+import random
 import asyncio
 import html
 import logging
@@ -237,9 +238,67 @@ async def on_cb(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     if action == "setmode":
         mid = _arg(parts, 2)
+
         if not s.set_mode(mid):
             return await q.answer("مود نامعتبر است.", show_alert=True)
+
+        # اگر اسم‌وفامیل انتخاب شد، برو به انتخاب دسته‌ها
+        if mid == "namefamily":
+            await q.answer()
+            return await q.message.edit_text(
+                panels.namefamily_category_text(),
+                parse_mode=HTML,
+                reply_markup=panels.namefamily_category_kb(s)
+            )
+
         await q.answer(f"مود شد: {s.mode_name()}")
+        return await _refresh_lobby(q, s)
+    
+    if action == "nftoggle":
+
+        cat = ":".join(parts[2:])
+
+        if cat in s.namefamily_categories:
+            s.namefamily_categories.remove(cat)
+        else:
+            s.namefamily_categories.append(cat)
+
+        await q.answer()
+
+        return await q.message.edit_text(
+            panels.namefamily_category_text(),
+            parse_mode=HTML,
+            reply_markup=panels.namefamily_category_kb(s)
+        )
+
+    if action == "nfrandom":
+
+        cats = [c for c, _ in db.list_categories()]
+
+        random.shuffle(cats)
+
+        s.namefamily_categories = cats[:6]
+
+        await q.answer("۶ دسته انتخاب شد.")
+
+        return await q.message.edit_text(
+            panels.namefamily_category_text(),
+            parse_mode=HTML,
+            reply_markup=panels.namefamily_category_kb(s)
+        )    
+
+    if action == "nfdone":
+
+        if not s.namefamily_categories:
+
+            cats = [c for c, _ in db.list_categories()]
+
+            random.shuffle(cats)
+
+            s.namefamily_categories = cats[:6]
+
+        await q.answer("ثبت شد.")
+
         return await _refresh_lobby(q, s)
 
     if action == "cat":

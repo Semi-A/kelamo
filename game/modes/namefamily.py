@@ -34,14 +34,27 @@ class NameFamilyMode:
     name = "اسم‌وفامیل"
     emoji = "✍️"
 
-    def __init__(self, words=None, ruleset=None, num_categories=None, **kw):
+    def __init__(
+        self,
+        words=None,
+        ruleset=None,
+        categories=None,
+        num_categories=None,
+        **kw
+    ):        
         self.words = list(words or [])
         self.ruleset = ruleset
         self.letter = random.choice(PERSIAN_LETTERS)
 
         # فقط دسته‌های استاندارد اسم‌وفامیل
-        self.cats = load_db_categories()
-
+        if categories:
+            self.cats = categories
+        else:
+            cats = load_db_categories()
+            self.cats = random.sample(
+                cats,
+                min(6, len(cats))
+            )
         # uid -> {cat_index: answer}
         self.answers = {}
 

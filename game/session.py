@@ -12,6 +12,20 @@ from game.modes import get_mode_class, mode_meta
 from core.normalize import normalize_word
 from game import ranking
 
+CHAIN_CATEGORIES = ["میوه", "رنگ", "کشور","شهر","حیوان","غذا","اشیا"]  # دسته‌های مجاز خودت رو بذار
+
+
+def _merge_categories(all_categories: dict, names: list) -> list:
+    merged, seen = [], set()
+    for name in names:
+        for w in all_categories.get(name, []):
+            n = (w or "").strip()
+            if n and n not in seen:
+                seen.add(n)
+                merged.append(w)
+    return merged
+
+
 # گزینه‌های زمان مسابقه (ثانیه) — 0 یعنی نامحدود
 TIME_OPTIONS = [
     (120,  "۲ دقیقه"),
@@ -62,6 +76,7 @@ class Session:
         self.used = set()                  # کلمات پذیرفته‌شده‌ی همین دور (ضدتکرار پاسخ)
         self.focus_mode = False
         self.panel_msg_id = None
+        self.namefamily_categories = []
         # ---- سیستم زمان ----
         self.time_limit = 300              # پیش‌فرض ۵ دقیقه
         self.started_at = None
@@ -143,8 +158,19 @@ class Session:
     def build_mode(self):
         cls = get_mode_class(self.mode_id)
         kwargs = {"ruleset": self.ruleset}
+
         if self.mode_id in ("classic_random", "classic_choice", "chain"):
             kwargs["category"] = self.category
+
+        if self.mode_id == "chain":
+            # به‌جای دسته‌ی انتخابی کاربر، فقط دسته‌های مجاز رو قاطی کن
+            kwargs["words"] = _merge_categories(self.all_categories, CHAIN_CATEGORIES)
+            kwargs["category"] = " / ".join(CHAIN_CATEGORIES)
+
+
+        elif self.mode_id == "namefamily":
+            kwargs["categories"] = self.namefamily_categories
+
         self.mode = cls(self.words, **kwargs)
         return self.mode    # ---- gameplay ----
     def _question_signature(self, q):

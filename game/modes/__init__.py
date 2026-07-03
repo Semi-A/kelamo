@@ -4,6 +4,12 @@ from .variable import VariableMode
 from .namefamily import NameFamilyMode
 from .clue import ClueMode
 
+from .classic import ClassicRandomMode, ClassicChoiceMode
+from .chain import ChainMode
+from .variable import VariableMode
+from .namefamily import NameFamilyMode
+from .clue import ClueMode
+
 MODE_ORDER = ["classic_random", "classic_choice", "chain", "namefamily", "variable", "clue"]
 
 REGISTRY = {
@@ -14,6 +20,20 @@ REGISTRY = {
     NameFamilyMode.id: NameFamilyMode,
     ClueMode.id: ClueMode,
 }
+
+# فقط این دسته‌ها وارد مود زنجیره می‌شن
+CHAIN_CATEGORIES = ["میوه‌ها", "حیوانات", "کشورها"]
+
+
+def _merge_categories(all_categories: dict, names: list) -> list:
+    merged, seen = [], set()
+    for name in names:
+        for w in all_categories.get(name, []):
+            n = (w or "").strip()
+            if n and n not in seen:
+                seen.add(n)
+                merged.append(w)
+    return merged
 
 _META = {
     "classic_random": {
