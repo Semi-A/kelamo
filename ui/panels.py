@@ -281,32 +281,16 @@ def namefamily_category_text():
     )
 
 def namefamily_category_kb(s):
-
     cats = db.list_categories()
-
     rows = []
-
     for cat, cnt in cats:
-
         mark = "✅" if cat in s.namefamily_categories else "⬜"
-
         rows.append([
-            B(
-                f"{mark} {cat}",
-                callback_data=f"lobby:nftoggle:{cat}"
-            )
+            B(f"{mark} {cat}", callback_data=f"k:nftoggle:{cat}")
         ])
 
-    rows.append([
-        B("🎲 انتخاب تصادفی", callback_data="lobby:nfrandom")
-    ])
-
-    rows.append([
-        B("✅ تایید", callback_data="lobby:nfdone")
-    ])
-
-    rows.append([
-        B("◀ بازگشت", callback_data="lobby:back")
-    ])
+    rows.append([B("🎲 انتخاب تصادفی", callback_data="k:nfrandom")])
+    rows.append([B("✅ تایید", callback_data="k:nfdone")])
+    rows.append([B("◀ بازگشت", callback_data="k:back")])
 
     return M(rows)
