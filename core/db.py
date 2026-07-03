@@ -15,6 +15,28 @@
 - executescript → execute (psycopg چند دستور را در یک رشته اجرا می‌کند).
 - خطای یکتایی sqlite3.IntegrityError → psycopg.errors.UniqueViolation.
 - PRAGMA table_info → information_schema.columns.
+
+=== یادداشت رفع‌باگ (categories/words) ===
+مشکل قبلی: هنگام seed کردن دسته‌های کاملاً جدید هم‌زمان با اجرای ربات
+روی Render، اضافه‌کردن کلمه برای یک دسته‌ی تازه گاهی شکست می‌خورد در
+حالی‌که کلمات دسته‌های قبلاً موجود بدون مشکل اضافه می‌شدند.
+
+علت: add_word برای هر عملیات (خواندن دسته، ساخت دسته، خواندن دوباره‌ی
+دسته، بررسی تکراری بودن کلمه، درج نهایی) از conn() جداگانه استفاده
+می‌کرد — یعنی هر کدام یک transaction/connection مستقل از pool می‌گرفتند.
+وقتی seeds.py و ربات هم‌زمان روی یک دیتابیس فعال بودند، این چند
+round-trip جدا مستعد race condition بود: اگر بین «ساخت دسته» و «خواندن
+دوباره‌ی id دسته» یک خطای گذرا (تصادم، قفل موقت و...) رخ می‌داد،
+add_category خطا را می‌بلعید (فقط print می‌کرد) و مقدار True/False
+برمی‌گرداند بدون این‌که add_word این خطا را واقعاً بررسی کند؛ نتیجه
+این می‌شد که category همچنان None می‌ماند و کل عملیات با پیام
+"CATEGORY CREATION FAILED" بی‌سروصدا شکست می‌خورد.
+
+راه‌حل: add_category حالا با INSERT ... ON CONFLICT (name) DO UPDATE
+... RETURNING id اجرا می‌شود — یک عملیات اتمیک که چه دسته تازه ساخته
+شود چه از قبل موجود باشد، همیشه id را در همان query برمی‌گرداند. دیگر
+نیازی به SELECT جداگانه‌ی بعد از INSERT نیست. add_word هم به همین
+ترتیب round-tripها را به حداقل رسانده است.
 """
 
 import time
@@ -457,23 +479,47 @@ def top_players(limit=10):
 
 
 # ---------- categories & words ----------
+#
+# نکته‌ی مهم: add_category قبلاً True/False برمی‌گرداند. حالا dict
+# {"id":..., "name":...} یا None برمی‌گرداند تا در همان query که دسته
+# را می‌سازد، id را هم اتمیک بگیریم و نیاز به SELECT جداگانه (که منشا
+# race condition بود) از بین برود. هر جای دیگر پروژه که از خروجی
+# add_category به‌صورت boolean استفاده می‌کرد اینجا اصلاح شده (seed_defaults
+# در همین فایل). اگر فایل دیگری در پروژه مستقیماً add_category را با
+# انتظار True/False صدا می‌زند، باید همان‌جا هم به `is not None` تغییر کند.
 
 def add_category(name):
-    print("ADDING CATEGORY:", name)
+    """دسته را اضافه می‌کند (اگر نبود) و در هر صورت اطلاعات آن را برمی‌گرداند.
+
+    خروجی: dict {"id": ..., "name": ...} در صورت موفقیت، یا None در صورت خطا.
+
+    این تابع اتمیک است: با یک INSERT ... ON CONFLICT ... DO UPDATE ...
+    RETURNING، چه دسته تازه ساخته شود چه از قبل موجود باشد، id در همان
+    query برمی‌گردد. این باعث می‌شود دیگر نیازی به یک SELECT جداگانه‌ی
+    بعد از INSERT نباشد که در حضور ترافیک هم‌زمان (مثلاً ربات + seeds.py
+    که هم‌زمان روی Render اجرا می‌شوند) مستعد race condition بود.
+    """
     name = (name or "").strip()
     if not name:
-        return False
+        return None
 
     try:
         with conn() as c:
-            c.execute(
-                "INSERT INTO categories(name) VALUES (%s) ON CONFLICT DO NOTHING",
-                (name,)
+            cur = c.execute(
+                """
+                INSERT INTO categories(name)
+                VALUES (%s)
+                ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+                RETURNING id, name
+                """,
+                (name,),
             )
-        return True
+            row = cur.fetchone()
+            return dict(row) if row else None
     except Exception as e:
-        print("add_category error:", e)
-        return False
+        print("add_category error:", repr(e), "| name:", name)
+        return None
+
 
 def del_category(name):
     with conn() as c:
@@ -489,7 +535,8 @@ def get_category(name):
             (name,)
         )
         return cur.fetchone()
-    
+
+
 def list_categories():
     with conn() as c:
         rows = c.execute("""
@@ -525,48 +572,69 @@ def word_exists(category, word):
 
 
 def add_word(category, word, difficulty=1, rarity=1, points=10, synonyms="", clue=""):
+    """کلمه را به دسته اضافه می‌کند؛ دسته را در صورت نبود می‌سازد.
+
+    نسخه‌ی اصلاح‌شده: به‌جای چند round-trip جدا (get_category → add_category
+    → get_category دوباره → find_word که خودش دوباره get_category صدا
+    می‌زند → insert نهایی)، مسیر به دو مرحله کاهش یافته:
+      1) add_category که اتمیک است و همیشه id معتبر برمی‌گرداند (یا None
+         اگر واقعاً خطایی رخ دهد که این‌بار بی‌سروصدا بلعیده نمی‌شود).
+      2) یک conn() واحد که هم بررسی تکراری‌بودن کلمه و هم درج نهایی را
+         در یک تراکنش انجام می‌دهد.
+    """
     category = (category or "").strip()
     word = (word or "").strip()
 
     if not category or not word:
         return False
 
-    cat = get_category(category)
-
-    if not cat:
-        add_category(category)
-        cat = get_category(category)
-
+    cat = add_category(category)  # idempotent: می‌سازد یا موجود را برمی‌گرداند
     if not cat:
         print("CATEGORY CREATION FAILED:", category)
-        return False
-    
-    if find_word(category, word):
         return False
 
     if isinstance(synonyms, (list, tuple, set)):
         synonyms = "،".join(str(x).strip() for x in synonyms if str(x).strip())
 
+    nw = normalize_word(word)
+
     try:
         with conn() as c:
-            c.execute("""
+            dup = c.execute(
+                """
+                SELECT 1 FROM words
+                WHERE category_id=%s AND normalized_word=%s
+                LIMIT 1
+                """,
+                (cat["id"], nw),
+            ).fetchone()
+            if dup:
+                return False  # از قبل موجود است
+
+            c.execute(
+                """
                 INSERT INTO words(
                     category_id, word, normalized_word,
                     difficulty, rarity, points, synonyms, clue
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (
-                cat["id"],
-                word,
-                normalize_word(word),
-                int(difficulty or 1),
-                int(rarity or 1),
-                int(points or 10),
-                synonyms or "",
-                clue or "",
-            ))
+                """,
+                (
+                    cat["id"],
+                    word,
+                    nw,
+                    int(difficulty or 1),
+                    int(rarity or 1),
+                    int(points or 10),
+                    synonyms or "",
+                    clue or "",
+                ),
+            )
         return True
     except IntegrityError:
+        return False
+    except Exception as e:
+        print("add_word error:", repr(e), "| category:", category, "| word:", word)
         return False
 
 
@@ -665,8 +733,15 @@ def import_words(records):
             cat = c.execute("SELECT id FROM categories WHERE name=%s", (category,)).fetchone()
             if not cat:
                 try:
-                    c.execute("INSERT INTO categories(name) VALUES (%s)", (category,))
-                    cat_id = c.execute("SELECT id FROM categories WHERE name=%s", (category,)).fetchone()["id"]
+                    cat_row = c.execute(
+                        """
+                        INSERT INTO categories(name) VALUES (%s)
+                        ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+                        RETURNING id
+                        """,
+                        (category,),
+                    ).fetchone()
+                    cat_id = cat_row["id"]
                 except IntegrityError:
                     skipped += 1
                     continue
@@ -804,8 +879,15 @@ def approve_suggestion(sid, admin_id, new_word=None, new_category=None):
     with conn() as c:
         cat = c.execute("SELECT id FROM categories WHERE name=%s", (category,)).fetchone()
         if not cat:
-            c.execute("INSERT INTO categories(name) VALUES (%s)", (category,))
-            cat_id = c.execute("SELECT id FROM categories WHERE name=%s", (category,)).fetchone()["id"]
+            cat_row = c.execute(
+                """
+                INSERT INTO categories(name) VALUES (%s)
+                ON CONFLICT (name) DO UPDATE SET name = EXCLUDED.name
+                RETURNING id
+                """,
+                (category,),
+            ).fetchone()
+            cat_id = cat_row["id"]
         else:
             cat_id = cat["id"]
 
